@@ -100,6 +100,7 @@ class RLHFDataset(Dataset):
 
         self.cache_dir = os.path.expanduser(config.get("cache_dir", "~/.cache/verl/rlhf"))
         self.prompt_key = config.get("prompt_key", "prompt")
+        self.context_key = config.get("context_key", None)
         self.image_key = config.get("image_key", "images")
         self.video_key = config.get("video_key", "videos")
         self.max_prompt_length = config.get("max_prompt_length", 1024)
@@ -108,8 +109,8 @@ class RLHFDataset(Dataset):
         self.truncation = config.get("truncation", "error")
         self.filter_overlong_prompts = config.get("filter_overlong_prompts", True)
 
-        self.num_workers = config.get("filter_overlong_prompts_workers", max(1, os.cpu_count() // 4))
-        self.num_workers = min(self.num_workers, os.cpu_count())
+        self.num_workers = config.get("filter_overlong_prompts_workers", max(1, len(os.sched_getaffinity(0)) // 4))
+        self.num_workers = min(self.num_workers, len(os.sched_getaffinity(0)))
         self.use_shm = config.get("use_shm", False)
         self.chat_template_func = config.get("chat_template_func", None)
         self.need_tools_kwargs = config.get("need_tools_kwargs", False)
@@ -148,6 +149,8 @@ class RLHFDataset(Dataset):
             prompt_key = self.prompt_key
             image_key = self.image_key
             video_key = self.video_key
+            # [MemAgent] Some datasets (e.g. memagent) have a context field that is prepended to the user message
+            context_key = getattr(self, "context_key", None)
 
             if processor is not None:
                 from verl.utils.dataset.vision_utils import process_image, process_video
@@ -161,14 +164,34 @@ class RLHFDataset(Dataset):
                     return len(processor(text=[raw_prompt], images=images, videos=videos)["input_ids"][0])
 
             else:
-
                 def doc2len(doc) -> int:
-                    return len(tokenizer.apply_chat_template(doc[prompt_key], add_generation_prompt=True))
+                    messages = doc[prompt_key]
+                    assert all(isinstance(msg, dict) for msg in messages), f"{prompt_key} must contain dict messages"
+                    assert all("role" in msg and "content" in msg for msg in messages), f"each message in {prompt_key} must contain role/content"
+
+                    if context_key is not None:
+                        # [MemAgent] 对于 memagent 数据需要加上 context 部分的长度
+                        context = doc[context_key]
+                        assert isinstance(context, str), f"{context_key} must be str, got {type(context)}"
+
+                        user_idx = next((i for i, msg in enumerate(messages) if msg.get("role") == "user"), None)
+                        assert user_idx is not None, f"{prompt_key} must contain at least one user message"
+                        # Keep filtering logic read-only to avoid mutating source rows in multiprocessing.
+                        messages = [
+                            {**msg, "content": f"{msg['content']}\n\n{context}"} if i == user_idx else msg
+                            for i, msg in enumerate(messages)
+                        ]
+
+                    return len(tokenizer.apply_chat_template(messages, add_generation_prompt=True))
+
+            filter_desc = f"Filtering prompts longer than {self.max_prompt_length} tokens"
+            max_prompt_length = self.max_prompt_length
+            filter_fn = lambda doc: doc2len(doc) <= max_prompt_length  # 不要传 self, 无法序列化
 
             self.dataframe = self.dataframe.filter(
-                lambda doc: doc2len(doc) <= self.max_prompt_length,
+                filter_fn,
                 num_proc=self.num_workers,
-                desc=f"Filtering prompts longer than {self.max_prompt_length} tokens",
+                desc=filter_desc,
             )
 
             print(f"filter dataset len: {len(self.dataframe)}")

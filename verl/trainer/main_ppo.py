@@ -70,6 +70,14 @@ class TaskRunner:
 
         from verl.utils.fs import copy_to_local
 
+        if os.environ.get("ENABLE_RAY_DEBUGPY", "0") == "1":
+            import debugpy
+            host = os.environ.get("DEBUGPY_HOST", "127.0.0.1")
+            port = int(os.environ.get("DEBUGPY_PORT", "5666"))
+            debugpy.listen((host, port))
+            print(f"[debug] TaskRunner waiting for VSCode attach at {host}:{port}")
+            debugpy.wait_for_client()
+
         print(f"TaskRunner hostname: {socket.gethostname()}, PID: {os.getpid()}")
 
         pprint(OmegaConf.to_container(config, resolve=True))
@@ -164,9 +172,13 @@ class TaskRunner:
         from verl.utils.dataset.rl_dataset import collate_fn
 
         # Create training and validation datasets.
-        train_dataset = create_rl_dataset(config.data.train_files, config.data, tokenizer, processor)
-        val_dataset = create_rl_dataset(config.data.val_files, config.data, tokenizer, processor)
-        train_sampler = create_rl_sampler(config.data, train_dataset)
+        # [MemAgent] Create ds inside RayPPOTrainer
+        if not config.recurrent.enable:
+            train_dataset = create_rl_dataset(config.data.train_files, config.data, tokenizer, processor)
+            val_dataset = create_rl_dataset(config.data.val_files, config.data, tokenizer, processor)
+            train_sampler = create_rl_sampler(config.data, train_dataset)
+        else:
+            train_dataset = val_dataset = train_sampler = None
 
         # Initialize the PPO trainer.
         trainer = RayPPOTrainer(

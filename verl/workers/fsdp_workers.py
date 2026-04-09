@@ -65,6 +65,9 @@ from verl.utils.import_utils import import_external_libs
 from verl.utils.model import compute_position_id_with_mask
 from verl.utils.py_functional import convert_to_regular_types
 from verl.workers.sharding_manager.fsdp_ulysses import FSDPUlyssesShardingManager
+import datetime
+def _now():  ##### [MemAgent] logging
+    return datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
@@ -90,6 +93,103 @@ def get_sharding_strategy(device_mesh):
     else:
         raise NotImplementedError(f"Get device mesh ndim={device_mesh.ndim}, but only support 1 or 2")
     return sharding_strategy
+
+
+import os, errno, atexit, signal
+
+_DEBUGPY_STARTED = False
+_DEBUGPY_LOCK_FD = None
+
+def _pid_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        # 单机一般不会出现；保守起见当活着
+        return True
+
+def _release_lock():
+    global _DEBUGPY_LOCK_FD, _DEBUGPY_LOCK_PATH
+    try:
+        if _DEBUGPY_LOCK_FD is not None:
+            os.close(_DEBUGPY_LOCK_FD)
+    finally:
+        _DEBUGPY_LOCK_FD = None
+        if _DEBUGPY_LOCK_PATH:
+            try:
+                os.unlink(_DEBUGPY_LOCK_PATH)
+            except FileNotFoundError:
+                pass
+            _DEBUGPY_LOCK_PATH = None
+
+def _install_cleanup(lock_path: str):
+    global _DEBUGPY_LOCK_PATH
+    _DEBUGPY_LOCK_PATH = lock_path
+    atexit.register(_release_lock)
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        signal.signal(sig, lambda *_: (_release_lock(), exit(0)))
+
+def _try_global_lock(lock_path="/tmp/debugpy_5679.lock"):
+    """单机：有陈旧锁就自动清理"""
+    global _DEBUGPY_LOCK_FD
+
+    while True:
+        try:
+            _DEBUGPY_LOCK_FD = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_RDWR)
+            os.write(_DEBUGPY_LOCK_FD, str(os.getpid()).encode())
+            _install_cleanup(lock_path)
+            return True
+
+        except OSError as e:
+            if e.errno != errno.EEXIST:
+                raise
+
+            # 锁已存在：读 pid 判断是否陈旧
+            try:
+                with open(lock_path, "r") as f:
+                    old_pid = int(f.read().strip())
+            except Exception:
+                old_pid = -1
+
+            if old_pid > 0 and _pid_alive(old_pid):
+                # 真的有人在占用（比如你另一个调试进程还在）
+                return False
+
+            # 陈旧锁：删掉重抢
+            try:
+                os.unlink(lock_path)
+            except FileNotFoundError:
+                pass
+
+
+def ray_debug_break(tag: str, port: int = 5679):
+    global _DEBUGPY_STARTED
+    if os.environ.get("ENABLE_RAY_DEBUGPY", "0") != "1":
+        return
+    if not (dist.is_available() and dist.is_initialized()):
+        return
+
+    import debugpy
+    host = os.environ.get("DEBUGPY_HOST", "127.0.0.1")
+
+    # 所有 rank 先对齐，避免有人先跑进 collective
+    dist.barrier()
+
+    if dist.get_rank() == 0:
+        # 只有拿到“全机锁”的那个 rank0 才 listen
+        i_am_owner = _try_global_lock(f"/tmp/debugpy_{port}.lock")
+        if i_am_owner and not _DEBUGPY_STARTED:
+            debugpy.listen((host, port))
+            _DEBUGPY_STARTED = True
+            print(f"[debugpy] listening at {host}:{port}, pid={os.getpid()}, tag={tag}")
+        # 只有 owner 才 wait_for_client（否则会卡死在等 attach）
+        if i_am_owner and not debugpy.is_client_connected():
+            print(f"[debugpy] waiting attach at {tag} ...")
+            debugpy.wait_for_client()
+    # attach 完再放行
+    dist.barrier()
 
 
 class ActorRolloutRefWorker(Worker, DistProfilerExtension):
@@ -153,8 +253,14 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
         # normalize config
         if self._is_actor:
+            #######
+            # [MemAgent][TODO] ADD: actor must aware how many steps are there in a batch, since we may have variant of batch sizes
+            # 需要检查一下, 这里 train_batch_size 会额外乘以 rollout.n, 原始没有这个逻辑
+            #######
+            update_steps_per_batch = self.config.actor.train_batch_size // self.config.actor.ppo_mini_batch_size
             self.config.actor.ppo_mini_batch_size *= self.config.rollout.n
             self.config.actor.ppo_mini_batch_size //= self.device_mesh.size() // self.ulysses_sequence_parallel_size
+            self.config.actor.train_batch_size = update_steps_per_batch * self.config.actor.ppo_mini_batch_size
             assert self.config.actor.ppo_mini_batch_size > 0, f"ppo_mini_batch_size {self.config.actor.ppo_mini_batch_size} should be larger than 0 after normalization"
             # micro bsz
             if self.config.actor.ppo_micro_batch_size is not None:
@@ -603,6 +709,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
     @DistProfiler.annotate(color="red")
     def update_actor(self, data: DataProto):
         # Support all hardwares
+        # ray_debug_break("update_actor:entry", port=5667)
         data = data.to("cpu")  # data will to device with each micro batch on actor.update_policy
 
         assert self._is_actor
@@ -646,7 +753,10 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
     @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
     @DistProfiler.annotate(color="red")
     def generate_sequences(self, prompts: DataProto):
+        # ray_debug_break("generate_sequences:entry", port=5667)
         # Support all hardwares
+        if torch.distributed.get_rank() == 0:
+            logger.info(f"{_now()} fsdp_workers generate_sequences")
         prompts = prompts.to(get_device_id())
 
         assert self._is_rollout
@@ -661,12 +771,21 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             log_gpu_memory_usage("After entering rollout sharding manager", logger=logger)
 
             prompts = self.rollout_sharding_manager.preprocess_data(prompts)
+            ######
+            # [MemAgent] MODIFY: apply pad_to and generation_kwargs
+            ######
             with simple_timer("generate_sequences", timing_generate):
-                output = self.rollout.generate_sequences(prompts=prompts)
+                output = self.rollout.generate_sequences(
+                    prompts=prompts, pad_to=prompts.meta_info.get("pad_to", None),
+                    **prompts.meta_info.get("generation_kwargs", {}))
 
             log_gpu_memory_usage("After rollout generation", logger=logger)
 
             output = self.rollout_sharding_manager.postprocess_data(output)
+            if torch.distributed.get_rank() == 0:
+                logger.info(f"{_now()} data postprocessed")
+        if torch.distributed.get_rank() == 0:
+            logger.info(f"{_now()} left rollout sharding manager")
 
         timing_generate.update(self.rollout_sharding_manager.timing)
         # We calculate the average timing across all ranks

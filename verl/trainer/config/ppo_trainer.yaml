@@ -152,6 +152,9 @@ actor_rollout_ref:
     # fsdp, fsdp2 or megatron. fsdp backend used here.
     strategy: fsdp
 
+    # [MemAgent] We have to do this. actor_rollout_ref is unware of training batch size
+    train_batch_size: ${data.train_batch_size}
+
     # Split each sample into sub-batches of this size for PPO
     ppo_mini_batch_size: 256
 
@@ -1013,6 +1016,32 @@ trainer:
 
   # Device to run training on (e.g., "cuda", "cpu")
   device: cuda
+
+recurrent:
+  enable: False
+  trival:
+    async_path: "recurrent/impls/async_trival.py"
+    async_name: REGISTER
+    config:
+      ~
+  memory:
+    path: "recurrent/impls/memory.py"
+    name: REGISTER
+    async_path: "recurrent/impls/async_memory.py"
+    async_name: REGISTER
+    config:
+      context_key: context
+      chunk_size: 5000
+      max_prompt_length: 1024
+      max_memorization_length: 1024
+      max_chunks: 8
+      max_final_response_length: 1024
+  tool_gsm8k:
+    async_path: "recurrent/impls/async_tool_gsm8k.py"
+    async_name: REGISTER
+    config:
+      max_turn: 5
+      max_generation_per_turn: 256
 
 # configs related to ray initialization
 ray_init:

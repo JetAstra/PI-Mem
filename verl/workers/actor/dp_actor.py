@@ -380,12 +380,26 @@ class DataParallelPPOActor(BasePPOActor):
         temperature = data.meta_info["temperature"]  # temperature must be in the data.meta_info to avoid silent error
         multi_turn = data.meta_info.get("multi_turn", False)
 
-        select_keys = ["responses", "input_ids", "attention_mask", "position_ids", "old_log_probs", "advantages"]
+        ######
+        # [MemAgent] ADD: loss mask
+        ######
+        select_keys = ["responses", "input_ids", "attention_mask", "position_ids", "old_log_probs", "advantages", "response_mask"]
         if multi_turn:
             select_keys.append("loss_mask")
         if self.config.use_kl_loss:
             select_keys.append("ref_log_prob")
-        batch = data.select(batch_keys=select_keys).batch
+        ######
+        # [MemAgent] ADD: check multirun padding mask
+        ######
+        padded = 'no_padding_mask' in data.batch
+        if padded:
+            from recurrent.utils import indexing_proto
+            # batch is a TensorDict here, we need a DataProto for code reusing.
+            proto = data.select(batch_keys=select_keys)
+            # we need to drop empty samples, since they will implact sequence-level averaging loss
+            batch = indexing_proto(proto, data.batch['no_padding_mask']).batch
+        else:
+            batch = data.select(batch_keys=select_keys).batch
         has_multi_modal_inputs = "multi_modal_inputs" in data.non_tensor_batch.keys()
 
         # Split to make minibatch iterator for updating the actor
@@ -394,6 +408,15 @@ class DataParallelPPOActor(BasePPOActor):
             num_mini_batches = data.batch.batch_size[0] // self.config.ppo_mini_batch_size
             non_tensor_select_keys = ["multi_modal_inputs"]
             dataloader = data.select(select_keys, non_tensor_select_keys).chunk(num_mini_batches)
+            raise NotImplementedError("[MemAgent] need to be fixed for multi-turn code")
+        ######
+        # [MemAgent] ADD: Splits `proto` into `self.config.update_steps_per_batch` chunks.
+        #     proto_split is similar to `np.array_split`/`torch.tensor_split`, support inequally-sized chunks.
+        #     note that self.config.train_batch_size has been injected in verl/workers/fsdp_workers.py
+        ######
+        if padded:
+            from recurrent.utils import td_split
+            dataloader = td_split(batch, self.config.train_batch_size // self.config.ppo_mini_batch_size)
         else:
             dataloader = batch.split(self.config.ppo_mini_batch_size)
 
@@ -423,12 +446,30 @@ class DataParallelPPOActor(BasePPOActor):
                 elif self.config.use_dynamic_bsz:
                     max_token_len = self.config.ppo_max_token_len_per_gpu * self.ulysses_sequence_parallel_size
                     micro_batches, _ = rearrange_micro_batches(batch=mini_batch, max_token_len=max_token_len)
+                    ###### [MemAgent] NOTE: rearrange_micro_batches will generate max(num_micro for num_micro in all_dp_workers) and torch.distributed.all_reduce is called
+                    ###### When debugging, set a breakpoint after here, or code will be stuck here.
                 else:
-                    self.gradient_accumulation = self.config.ppo_mini_batch_size // self.config.ppo_micro_batch_size_per_gpu
-                    # split batch into micro_batches
-                    micro_batches = mini_batch.split(self.config.ppo_micro_batch_size_per_gpu)
+                    ######
+                    # [MemAgent] ADD: I will not disable dynamic_bsz, just in case, use proto_split to get num_micro_batches
+                    ######
+                    if padded:
+                        from recurrent.utils import td_split
+                        num_micro_batches = -(-len(mini_batch) // self.config.ppo_micro_batch_size_per_gpu)
+                        micro_batches = td_split(mini_batch, num_micro_batches)
+                    else:
+                        self.gradient_accumulation = self.config.ppo_mini_batch_size // self.config.ppo_micro_batch_size_per_gpu
+                        # split batch into micro_batches
+                        micro_batches = mini_batch.split(self.config.ppo_micro_batch_size_per_gpu)
 
                 self.actor_optimizer.zero_grad()
+
+                #######
+                # [MemAgent] ADD: For unbias grad_gcc, see MODIFY in below for more info.
+                #######
+                if not self.config.use_dynamic_bsz:
+                    from warnings import warn
+                    warn("Using dynamic bsz is highly recomended for multiturn since there will be padding samples")
+                mini_batch_token_nums = data['response_mask'].sum()
 
                 for data in micro_batches:
                     # Support all hardwares
@@ -452,6 +493,10 @@ class DataParallelPPOActor(BasePPOActor):
                     else:
                         response_mask = attention_mask[:, -response_length:]
 
+                    #######
+                    # [MemAgent][TODO] MODIFIED: use loss_mask directly, need to check response mask!
+                    #######
+                    response_mask = data['response_mask']
                     old_log_prob = data["old_log_probs"]
                     advantages = data["advantages"]
 
@@ -504,11 +549,33 @@ class DataParallelPPOActor(BasePPOActor):
                         metrics["actor/kl_loss"] = kl_loss.detach().item()
                         metrics["actor/kl_coef"] = self.config.kl_loss_coef
 
-                    if self.config.use_dynamic_bsz:
-                        # relative to the dynamic bsz
-                        loss = policy_loss * (len(data) / self.config.ppo_mini_batch_size)
+                    ######
+                    # [MemAgent][TODO] need to check!
+                    # MODIFY: we have to fix grad_acc computation: weighted averaging by token num in stead of len(data)
+                    #         See 
+                    #         If we use Dr. GRPO algorithm（unbias_length_enable）, then this fix is no 
+                    #           more needed since policy averaging there is sequence-level.
+                    #         Since we have a variant of batchsize, we also remove self.gradient_accumulation
+                    ######
+                    if loss_agg_mode in ["token-mean", "seq-mean-token-sum", "seq-mean-token-mean", "seq-mean-token-sum-norm"]:
+                        acc_grad_mode = loss_agg_mode.split("-")[0]
                     else:
-                        loss = policy_loss / self.gradient_accumulation
+                        raise ValueError(f"Invalid loss_agg_mode: {loss_agg_mode}")
+                    if acc_grad_mode == "seq":
+                        loss = policy_loss * (len(data) / len(mini_batch)) # self.gradient_accumulation
+                    elif acc_grad_mode == "token":
+                        # weights by token nums, note that we want to apply a simple scalar, or the compute-graph will be extremely large.
+                        loss = policy_loss * (response_mask.sum().item() / mini_batch_token_nums.item())
+                    else:
+                        raise NotImplementedError(f"Unsupported acc_grad_mode: {acc_grad_mode}")
+
+                    ######## Original Code ########
+                    # if self.config.use_dynamic_bsz:
+                    #     # relative to the dynamic bsz
+                    #     loss = policy_loss * (len(data) / self.config.ppo_mini_batch_size)
+                    # else:
+                    #     loss = policy_loss / self.gradient_accumulation
+                    ######## Original Code ########
                     loss.backward()
 
                     data = {

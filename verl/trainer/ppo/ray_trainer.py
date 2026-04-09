@@ -58,6 +58,7 @@ from verl.utils.metric import (
 from verl.utils.seqlen_balancing import get_seqlen_balanced_partitions, log_seqlen_unbalance
 from verl.utils.torch_functional import masked_mean
 from verl.utils.tracking import ValidationGenerationsLogger
+import loguru
 
 WorkerType = Type[Worker]
 
@@ -151,6 +152,8 @@ def apply_kl_penalty(data: DataProto, kl_ctrl: core_algos.AdaptiveKLController, 
     token_level_scores = data.batch["token_level_scores"]
     batch_size = data.batch.batch_size[0]
 
+    # [MemAgent][TODO] MODIFIED: use loss_mask directly
+    # 是否直接参考memagent代码 response_mask = compute_response_mask(data)?
     if multi_turn:
         loss_mask = data.batch["loss_mask"]
         response_mask = loss_mask[:, -response_length:]
@@ -273,6 +276,47 @@ def compute_advantage(data: DataProto, adv_estimator, gamma=1.0, lam=1.0, num_re
         data.batch["returns"] = returns
     return data
 
+def compute_1D_grpo_advantage(token_level_rewards: torch.Tensor,
+                                   index: torch.Tensor,
+                                   epsilon: float = 1e-6,
+                                   use_adv: bool = True):
+    """
+    [MemAgent] Broadcast advantages
+    adapted from `core_algos`, but return 1D advantage only.
+    
+    Returns:
+        advantages: `(torch.Tensor)`
+            shape: (bs,)
+        Returns: `(torch.Tensor)`
+            shape: (bs,)
+    """
+    scores = token_level_rewards.sum(dim=-1)
+    from collections import defaultdict
+    id2score = defaultdict(list)
+    id2mean = {}
+    id2std = {}
+    
+    with torch.no_grad():
+        bsz = scores.shape[0]
+        for i in range(bsz):
+            id2score[index[i]].append(scores[i])
+        for idx in id2score:
+            if len(id2score[idx]) == 1:
+                id2mean[idx] = torch.tensor(0.0)
+                if use_adv:
+                    id2std[idx] = torch.tensor(1.0)
+            elif len(id2score[idx]) > 1:
+                id2mean[idx] = torch.mean(torch.tensor(id2score[idx]))
+                if use_adv:
+                    id2std[idx] = torch.std(torch.tensor([id2score[idx]]))
+            else:
+                raise ValueError(f"no score in prompt index: {idx}")
+        for i in range(bsz):
+            if use_adv:
+                scores[i] = (scores[i] - id2mean[index[i]]) / (id2std[index[i]] + epsilon)
+            else:
+                scores[i] = scores[i] - id2mean[index[i]]
+    return scores
 
 class RayPPOTrainer:
     # TODO: support each role have individual ray_worker_group_cls,
@@ -473,6 +517,26 @@ class RayPPOTrainer:
         if config.actor_rollout_ref.rollout.val_kwargs.do_sample:
             assert config.actor_rollout_ref.rollout.temperature > 0, "validation gen temperature should be greater than 0 when enabling do_sample"
 
+        # [MemAgent][TODO] check consistency with implementation in `init_worker`
+        self.async_rollout_mode = False
+        if self.config.actor_rollout_ref.rollout.mode == "async":
+            self.async_rollout_mode = True
+
+        if config.recurrent.enable:
+            from recurrent.interface import RRegister
+            enabled_conf = getattr(config.recurrent, config.recurrent.enable)
+            if not self.async_rollout_mode:
+                self.recurrent_register = RRegister.from_filename(enabled_conf.path, enabled_conf.name)
+            else:
+                assert config.actor_rollout_ref.rollout.chat_scheduler == "recurrent.async_utils.ChatCompletionProxy", \
+                    "`chat_scheduler` must be set to `recurrent.async_utils.ChatCompletionProxy` when using async rollout in Recurrent RL"
+                assert hasattr(enabled_conf, "async_path") and hasattr(enabled_conf, "async_name"), \
+                    f"`async_path` and `async_name` must be set in recurrent.{config.recurrent.enable} when using async rollout"
+                self.recurrent_register = RRegister.from_filename(enabled_conf.async_path, enabled_conf.async_name)
+
+            conf = dict(enabled_conf.config) if enabled_conf.config is not None else {}
+            self.recurrent_config = self.recurrent_register.config_cls(**conf)
+
         # check multi_turn with tool config
         if config.actor_rollout_ref.rollout.multi_turn.enable:
             assert config.actor_rollout_ref.rollout.multi_turn.tool_config_path is not None or config.actor_rollout_ref.rollout.multi_turn.interaction_config_path is not None, "tool_config_path or interaction_config_path must be set when enabling multi_turn with tool, due to no role-playing support"
@@ -484,14 +548,31 @@ class RayPPOTrainer:
         """
         Creates the train and validation dataloaders.
         """
-        # TODO: we have to make sure the batch size is divisible by the dp size
-        from verl.trainer.main_ppo import create_rl_dataset, create_rl_sampler
 
-        if train_dataset is None:
-            train_dataset = create_rl_dataset(self.config.data.train_files, self.config.data, self.tokenizer, self.processor)
-        if val_dataset is None:
-            val_dataset = create_rl_dataset(self.config.data.val_files, self.config.data, self.tokenizer, self.processor)
-        self.train_dataset, self.val_dataset = train_dataset, val_dataset
+        from verl.trainer.main_ppo import create_rl_dataset, create_rl_sampler
+        # TODO: we have to make sure the batch size is divisible by the dp size
+        if self.config.recurrent.enable:
+            # [MemAgent] Create customized dataset
+            self.train_dataset = self.recurrent_register.dataset_cls(
+                recurrent_config=self.recurrent_config,
+                data_config=self.config.data,
+                data_files=self.config.data.train_files,
+                tokenizer=self.tokenizer,
+                processor=self.processor,
+            )
+            self.val_dataset = self.recurrent_register.dataset_cls(
+                recurrent_config=self.recurrent_config,
+                data_config=self.config.data,
+                data_files=self.config.data.val_files,
+                tokenizer=self.tokenizer,
+                processor=self.processor,
+            )
+        else:
+            if train_dataset is None:
+                train_dataset = create_rl_dataset(self.config.data.train_files, self.config.data, self.tokenizer, self.processor)
+            if val_dataset is None:
+                val_dataset = create_rl_dataset(self.config.data.val_files, self.config.data, self.tokenizer, self.processor)
+            self.train_dataset, self.val_dataset = train_dataset, val_dataset
 
         if train_sampler is None:
             train_sampler = create_rl_sampler(self.config.data, self.train_dataset)
@@ -616,13 +697,21 @@ class RayPPOTrainer:
                 return {}
 
             # Store original inputs
-            input_ids = test_batch.batch["input_ids"]
-            # TODO: Can we keep special tokens except for padding tokens?
-            input_texts = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in input_ids]
-            sample_inputs.extend(input_texts)
+            if not self.config.recurrent.enable:
+                input_ids = test_batch.batch["input_ids"]
+                # TODO: Can we keep special tokens except for padding tokens?
+                input_texts = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in input_ids]
+                sample_inputs.extend(input_texts)
+            else:
+                ###### [MemAgent]
+                sample_inputs.extend(test_batch.non_tensor_batch['sample_uuid'])
 
-            batch_keys_to_pop = ["input_ids", "attention_mask", "position_ids"]
-            non_tensor_batch_keys_to_pop = ["raw_prompt_ids"]
+            ###### [MemAgent]
+            if self.config.recurrent.enable:
+                batch_keys_to_pop, non_tensor_batch_keys_to_pop = self.val_dataset.get_bactch_keys()
+            else:
+                batch_keys_to_pop = ["input_ids", "attention_mask", "position_ids"]
+                non_tensor_batch_keys_to_pop = ["raw_prompt_ids"]
             if "multi_modal_data" in test_batch.non_tensor_batch:
                 non_tensor_batch_keys_to_pop.append("multi_modal_data")
             if "raw_prompt" in test_batch.non_tensor_batch:
@@ -645,17 +734,26 @@ class RayPPOTrainer:
             }
             print(f"test_gen_batch meta info: {test_gen_batch.meta_info}")
 
-            # pad to be divisible by dp_size
-            test_gen_batch_padded, pad_size = pad_dataproto_to_divisor(test_gen_batch, self.actor_rollout_wg.world_size)
-            if not self.async_rollout_mode:
-                test_output_gen_batch_padded = self.actor_rollout_wg.generate_sequences(test_gen_batch_padded)
-            else:
-                self.async_rollout_manager.wake_up()
-                test_output_gen_batch_padded = self.async_rollout_manager.generate_sequences(test_gen_batch_padded)
-                self.async_rollout_manager.sleep()
+            ######
+            # [MemAgent] ADD: no need to padding. indexing is needed.
+            ######
+            if not self.config.recurrent.enable:
+                # pad to be divisible by dp_size
+                test_gen_batch_padded, pad_size = pad_dataproto_to_divisor(test_gen_batch, self.actor_rollout_wg.world_size)
+                if not self.async_rollout_mode:
+                    test_output_gen_batch_padded = self.actor_rollout_wg.generate_sequences(test_gen_batch_padded)
+                else:
+                    self.async_rollout_manager.wake_up()
+                    test_output_gen_batch_padded = self.async_rollout_manager.generate_sequences(test_gen_batch_padded)
+                    self.async_rollout_manager.sleep()
 
-            # unpad
-            test_output_gen_batch = unpad_dataproto(test_output_gen_batch_padded, pad_size=pad_size)
+                # unpad
+                test_output_gen_batch = unpad_dataproto(test_output_gen_batch_padded, pad_size=pad_size)
+            else:
+                from recurrent.utils import final_batch
+                output_gen_batch, final_mask, sample_index = self.generation_manager.run_llm_loop(test_gen_batch, {})
+                test_output_gen_batch = final_batch(output_gen_batch, final_mask, sample_index)
+
             print("validation generation end")
 
             # Store generated outputs
@@ -802,6 +900,26 @@ class RayPPOTrainer:
                 config=self.config,
                 worker_group=self.actor_rollout_wg,
             )
+
+        # [MemAgent] create generation manager for recurrent rollout
+        if self.config.recurrent.enable:
+            if not self.async_rollout_mode:
+                from recurrent.generation_manager import LLMGenerationManager
+                self.generation_manager = LLMGenerationManager(
+                    tokenizer=self.tokenizer,
+                    actor_rollout_wg=self.actor_rollout_wg,
+                    config=self.recurrent_config,
+                    agent_cls=self.recurrent_register.agent_cls,
+                )
+            else:
+                from recurrent.async_generation_manager import AsyncLLMGenerationManager
+                self.generation_manager = AsyncLLMGenerationManager(
+                    tokenizer=self.tokenizer,
+                    async_server=self.async_rollout_manager,
+                    config=self.recurrent_config,
+                    rollout_config=self.config.actor_rollout_ref.rollout,
+                    agent_cls=self.recurrent_register.agent_cls,
+                )
 
     def _save_checkpoint(self):
         from verl.utils.fs import local_mkdir_safe
@@ -959,8 +1077,12 @@ class RayPPOTrainer:
                 batch: DataProto = DataProto.from_single_dict(batch_dict)
 
                 # pop those keys for generation
-                batch_keys_to_pop = ["input_ids", "attention_mask", "position_ids"]
-                non_tensor_batch_keys_to_pop = ["raw_prompt_ids"]
+                ###### [MemAgent]
+                if self.config.recurrent.enable:
+                    batch_keys_to_pop, non_tensor_batch_keys_to_pop = self.train_dataset.get_bactch_keys()
+                else:
+                    batch_keys_to_pop = ["input_ids", "attention_mask", "position_ids"]
+                    non_tensor_batch_keys_to_pop = ["raw_prompt_ids"]
                 if "multi_modal_data" in batch.non_tensor_batch:
                     non_tensor_batch_keys_to_pop.append("multi_modal_data")
                 if "raw_prompt" in batch.non_tensor_batch:
@@ -979,16 +1101,59 @@ class RayPPOTrainer:
                 with marked_timer("step", timing_raw):
                     # generate a batch
                     with marked_timer("gen", timing_raw, color="red"):
-                        if not self.async_rollout_mode:
-                            gen_batch_output = self.actor_rollout_wg.generate_sequences(gen_batch)
+                        if not self.config.recurrent.enable:
+                            if not self.async_rollout_mode:
+                                gen_batch_output = self.actor_rollout_wg.generate_sequences(gen_batch)
+                            else:
+                                self.async_rollout_manager.wake_up()
+                                gen_batch_output = self.async_rollout_manager.generate_sequences(gen_batch)
+                                self.async_rollout_manager.sleep()
+                            timing_raw.update(gen_batch_output.meta_info["timing"])
+                            gen_batch_output.meta_info.pop("timing", None)
+                        
+                        ####################
+                        # [MemAgent] Below is all about agents - the "LLM + forloop"
+                        ####################
                         else:
-                            self.async_rollout_manager.wake_up()
-                            gen_batch_output = self.async_rollout_manager.generate_sequences(gen_batch)
-                            self.async_rollout_manager.sleep()
-                        timing_raw.update(gen_batch_output.meta_info["timing"])
-                        gen_batch_output.meta_info.pop("timing", None)
+                            if self.config.algorithm.adv_estimator == AdvantageEstimator.REMAX:
+                                raise NotImplementedError("REMAX is not implemented for recurrent.")
+                            batch.non_tensor_batch['uid'] = np.array(
+                                [str(uuid.uuid4()) for _ in range(len(batch.batch))], dtype=object)
+                            # Note that we repeat outside the loop, since the generated responses are not aligned and we cannot
+                            # simply union them.
+                            # Also, just as what happened in validate, we will always set n=1 in generation_kwargs.
+                            batch = batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
+                            gen_batch = gen_batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
+                            gen_batch_output, final_mask, sample_index = self.generation_manager.run_llm_loop(gen_batch, timing_raw)
 
-                    if self.config.algorithm.adv_estimator == AdvantageEstimator.REMAX:
+                            assert final_mask.sum().item() == len(batch.batch), \
+                                "The number of final responses should be equal to the number of prompts." \
+                                f"{len(batch.non_tensor_batch['uid'])} != {len(batch.batch)}"
+                            
+                            # This is a simplified diagram to show how sample_index works.
+                            # DataProto and 2D tensors represented as a list of samples.
+
+                            # ex. batch = [s1, s2, s3, s4]
+                            #     gen_batch = [s1_turn1, s2_turn1, s3_turn1, s4_turn1, s1_turn2, s3_turn2, s3_turn3, s1_final, s2_final, s3_final, s4_final]
+                            #     final_mask = [      F,        F,        F,        F,        F,        F,        F,        T,        T,        T,        T]
+                            #     sample_index = [    0,        1,        2,        3,        0,        2,        2,        0,        1,        2,        3]
+                            
+                            # then, batch[sample_index] will be
+                            #                 [      s1,       s2,       s3,       s4,       s1,       s3,       s3,       s1,       s2,       s3,       s4]
+                            # We map info from original_sample to gen_batch_output now, e.x. in reward computation
+
+                            # Will be used in advantage computation.
+                            gen_batch_output.batch['final_mask'] = final_mask
+                            gen_batch_output.check_consistency()
+
+                            # padding for forwarding
+                            original_batch = batch # keep original info for reward computation
+                            batch = gen_batch_output
+
+                            workflow_metrics = gen_batch_output.meta_info.pop("metrics", {})
+                            metrics.update(workflow_metrics)
+
+                    if self.config.algorithm.adv_estimator == AdvantageEstimator.REMAX and (not self.config.recurrent.enable):
                         with marked_timer("gen_max", timing_raw, color="purple"):
                             gen_baseline_batch = deepcopy(gen_batch)
                             gen_baseline_batch.meta_info["do_sample"] = False
@@ -1004,19 +1169,25 @@ class RayPPOTrainer:
 
                             del gen_baseline_batch, gen_baseline_output
 
-                    batch.non_tensor_batch["uid"] = np.array([str(uuid.uuid4()) for _ in range(len(batch.batch))], dtype=object)
-                    # repeat to align with repeated responses in rollout
-                    batch = batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
-                    batch = batch.union(gen_batch_output)
+                    if not self.config.recurrent.enable:
+                        batch.non_tensor_batch["uid"] = np.array([str(uuid.uuid4()) for _ in range(len(batch.batch))], dtype=object)
+                        # repeat to align with repeated responses in rollout
+                        batch = batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
+                        batch = batch.union(gen_batch_output)
 
-                    batch.batch["response_mask"] = compute_response_mask(batch)
+                    if "response_mask" not in batch.batch:
+                        batch.batch["response_mask"] = compute_response_mask(batch)
                     # Balance the number of valid tokens across DP ranks.
                     # NOTE: This usually changes the order of data in the `batch`,
                     # which won't affect the advantage calculation (since it's based on uid),
                     # but might affect the loss calculation (due to the change of mini-batching).
                     # TODO: Decouple the DP balancing and mini-batching.
-                    if self.config.trainer.balance_batch:
+                    #######
+                    # [MemAgent] MODIFY: we do not want to break the order in batch since we have to maintain `final_mask` and `sample_index`
+                    #######
+                    if self.config.trainer.balance_batch and not self.config.recurrent.enable:
                         self._balance_batch(batch, metrics=metrics)
+                    #######
 
                     # compute global_valid tokens
                     batch.meta_info["global_token_num"] = torch.sum(batch.batch["attention_mask"], dim=-1).tolist()
@@ -1024,13 +1195,53 @@ class RayPPOTrainer:
                     with marked_timer("reward", timing_raw, color="yellow"):
                         # compute reward model score
                         if self.use_rm:
+                            # [MemAgent][TODO] 需要检查，qwenlong 应该是需要 use_rm
+                            if self.config.recurrent.enable:
+                                raise NotImplementedError("RM is not implemented for recurrent.")
                             reward_tensor = self.rm_wg.compute_rm_score(batch)
                             batch = batch.union(reward_tensor)
-
-                        if self.config.reward_model.launch_reward_fn_async:
-                            future_reward = compute_reward_async.remote(batch, self.config, self.tokenizer)
+                        if not self.config.recurrent.enable:  ###### [MemAgent]
+                            if self.config.reward_model.launch_reward_fn_async:
+                                future_reward = compute_reward_async.remote(batch, self.config, self.tokenizer)
+                            else:
+                                reward_tensor, reward_extra_infos_dict = compute_reward(batch, self.reward_fn)
                         else:
-                            reward_tensor, reward_extra_infos_dict = compute_reward(batch, self.reward_fn)
+                            from recurrent.utils import final_batch
+                            ##### make sure that samples in indexed proto are in same order as original_batch
+                            reward_batch = final_batch(batch, final_mask, sample_index).union(original_batch)
+                            reward_tensor, reward_extra_infos_dict = compute_reward(reward_batch, self.reward_fn)
+                            # pad for log_prob
+                            batch, pad_size = pad_dataproto_to_divisor(batch, self.actor_rollout_wg.world_size)
+                    
+                    # [MemAgent][TODO] 需要检查 dapo filter 逻辑，这里没有走 RayDAPOTrainer
+                    # 这里可能有 bug，如果当前 batch 全部被删掉了，后续的流程可能会出问题（比如 log_prob 计算会报错）
+                    if self.config.recurrent.enable and self.config.algorithm.get("filter_groups", None):
+                        raise NotImplementedError("filter_groups is not implemented for recurrent yet.") 
+                        # NOTE: When prompts after filtering is less than train batch size,
+                        # we skip to the next generation batch
+                        reward_batch.non_tensor_batch["seq_reward"] = reward_tensor.sum(dim=-1).numpy()
+
+                        # Collect the sequence reward for each trajectory
+                        prompt_uid2metric_vals = defaultdict(list)
+                        for uid, metric_val in zip(reward_batch.non_tensor_batch["uid"], reward_batch.non_tensor_batch["seq_reward"]):
+                            prompt_uid2metric_vals[uid].append(metric_val)
+
+                        prompt_uid2metric_std = {}
+                        for prompt_uid, metric_vals in prompt_uid2metric_vals.items():
+                            prompt_uid2metric_std[prompt_uid] = np.std(metric_vals)
+
+                        kept_prompt_uids = [uid for uid, std in prompt_uid2metric_std.items() if std > 0 or len(prompt_uid2metric_vals[uid]) == 1]
+                        kept_traj_idxs = []
+                        for idx, traj_from_prompt_uid in enumerate(batch.non_tensor_batch["uid"]):
+                            if traj_from_prompt_uid in kept_prompt_uids:
+                                kept_traj_idxs.append(idx)
+                        kept_traj_idxs = np.array(kept_traj_idxs, dtype=int)
+
+                        batch = batch[kept_traj_idxs]
+                        final_mask = final_mask[kept_traj_idxs]
+                        sample_index = sample_index[kept_traj_idxs]
+                        metrics["train/kept_prompts"] = len(kept_prompt_uids)
+                        metrics["train/kept_samples"] = len(kept_traj_idxs)
 
                     # recompute old_log_probs
                     with marked_timer("old_log_prob", timing_raw, color="blue"):
@@ -1084,36 +1295,72 @@ class RayPPOTrainer:
                             batch = batch.union(values)
 
                     with marked_timer("adv", timing_raw, color="brown"):
-                        # we combine with rule-based rm
-                        reward_extra_infos_dict: dict[str, list]
-                        if self.config.reward_model.launch_reward_fn_async:
-                            reward_tensor, reward_extra_infos_dict = ray.get(future_reward)
-                        batch.batch["token_level_scores"] = reward_tensor
+                        ###############
+                        # [MemAgent] ORIGINAL
+                        ###############
+                        if not self.config.recurrent.enable:
+                            # we combine with rule-based rm
+                            reward_extra_infos_dict: dict[str, list]
+                            if self.config.reward_model.launch_reward_fn_async:
+                                reward_tensor, reward_extra_infos_dict = ray.get(future_reward)
+                            batch.batch["token_level_scores"] = reward_tensor
 
-                        if reward_extra_infos_dict:
-                            batch.non_tensor_batch.update({k: np.array(v) for k, v in reward_extra_infos_dict.items()})
+                            if reward_extra_infos_dict:
+                                batch.non_tensor_batch.update({k: np.array(v) for k, v in reward_extra_infos_dict.items()})
 
-                        # compute rewards. apply_kl_penalty if available
-                        if self.config.algorithm.use_kl_in_reward:
-                            batch, kl_metrics = apply_kl_penalty(batch, kl_ctrl=self.kl_ctrl_in_reward, kl_penalty=self.config.algorithm.kl_penalty)
-                            metrics.update(kl_metrics)
-                        else:
-                            batch.batch["token_level_rewards"] = batch.batch["token_level_scores"]
+                            # compute rewards. apply_kl_penalty if available
+                            if self.config.algorithm.use_kl_in_reward:
+                                batch, kl_metrics = apply_kl_penalty(batch, kl_ctrl=self.kl_ctrl_in_reward, kl_penalty=self.config.algorithm.kl_penalty)
+                                metrics.update(kl_metrics)
+                            else:
+                                batch.batch["token_level_rewards"] = batch.batch["token_level_scores"]
 
-                        # compute advantages, executed on the driver process
+                            # compute advantages, executed on the driver process
 
-                        norm_adv_by_std_in_grpo = self.config.algorithm.get("norm_adv_by_std_in_grpo", True)  # GRPO adv normalization factor
+                            norm_adv_by_std_in_grpo = self.config.algorithm.get("norm_adv_by_std_in_grpo", True)  # GRPO adv normalization factor
 
-                        batch = compute_advantage(
-                            batch,
-                            adv_estimator=self.config.algorithm.adv_estimator,
-                            gamma=self.config.algorithm.gamma,
-                            lam=self.config.algorithm.lam,
-                            num_repeat=self.config.actor_rollout_ref.rollout.n,
-                            norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
-                            multi_turn=self.config.actor_rollout_ref.rollout.multi_turn.enable,
-                            config=self.config.algorithm,
-                        )
+                            batch = compute_advantage(
+                                batch,
+                                adv_estimator=self.config.algorithm.adv_estimator,
+                                gamma=self.config.algorithm.gamma,
+                                lam=self.config.algorithm.lam,
+                                num_repeat=self.config.actor_rollout_ref.rollout.n,
+                                norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
+                                multi_turn=self.config.actor_rollout_ref.rollout.multi_turn.enable,
+                                config=self.config.algorithm,
+                            )
+                            #############
+                        else:  ###### [MemAgent] recurrent: 1D GRPO scalar advantage then broadcast to token-level by sample_index.
+                            batch = unpad_dataproto(batch, pad_size)
+                        
+                            if self.use_rm:
+                                raise NotImplementedError("RM is not implemented for recurrent.")
+
+                            # Hack compute_advantage function, because it will return a 2D tensor
+                            # I'd rather have a 1D adv, manually indexing and then apply it to every non-mask token.
+                            # use reward_batch: have to unmask and remask
+                            # use batch: incorrect adv
+                            if not self.config.algorithm.adv_estimator == AdvantageEstimator.GRPO:
+                                raise NotImplementedError("Only GRPO is implemented for recurrent.")
+                            advantage_scalar = compute_1D_grpo_advantage(token_level_rewards=reward_tensor, 
+                                                                         index=reward_batch.non_tensor_batch['uid'],
+                                                                         use_adv=self.config.algorithm.norm_adv_by_std_in_grpo)
+                            advantage_scalar = advantage_scalar[sample_index]  # broadcast here
+
+                            # apply adv to non-mask tokens
+                            response_length = batch.batch['responses'].size(-1)
+                            eos_mask = batch.batch['response_mask']
+                            advantages = advantage_scalar.unsqueeze(-1).tile([1, response_length]) * eos_mask
+                            batch.batch['advantages'] = advantages
+                            batch.batch['returns'] = advantages                             
+                            # turns of a sample will have the same final reward, now we mapping turns to samples
+                            batch.batch['token_level_scores'] = reward_tensor[sample_index]
+
+                            if not self.config.actor_rollout_ref.actor.get('use_kl_loss', False):
+                                loguru.logger.warning("KL penalty is not implemented for recurrent.")
+                            
+                            batch.batch['token_level_rewards'] = batch.batch['token_level_scores']
+
 
                     # update critic
                     if self.use_critic:
@@ -1124,6 +1371,23 @@ class RayPPOTrainer:
 
                     # implement critic warmup
                     if self.config.trainer.critic_warmup <= self.global_steps:
+                        wsz = self.actor_rollout_wg.world_size
+                        if self.config.recurrent.enable:
+                            ########
+                            # [MemAgent] ADD: paddding for actor updating.
+                            ########
+                            if len(batch) % wsz != 0:
+                                from recurrent.utils import graceful_padding, indexing_proto
+                                padding_index, no_padding_mask = graceful_padding(len(batch), wsz)
+                                # use batch[-1] as padding, masked out
+                                batch = indexing_proto(batch, padding_index)
+                                batch.batch['attention_mask'][~no_padding_mask, :] = 0
+                                batch.batch['response_mask'][~no_padding_mask, :] = 0
+                                batch.batch['no_padding_mask'] = no_padding_mask
+                                batch.meta_info['padded'] = True
+                            else:
+                                # still need this to activate recurrent-related code in `update_actor`
+                                batch.batch['no_padding_mask'] = torch.ones(len(batch), dtype=torch.bool)
                         # update actor
                         with marked_timer("update_actor", timing_raw, color="red"):
                             batch.meta_info["multi_turn"] = self.config.actor_rollout_ref.rollout.multi_turn.enable
@@ -1167,6 +1431,9 @@ class RayPPOTrainer:
                     }
                 )
                 # collect metrics
+                if batch.meta_info.get('padded', False):  ##### [MemAgent]
+                    from recurrent.utils import indexing_proto
+                    batch = indexing_proto(batch, batch.batch['no_padding_mask'])
                 metrics.update(compute_data_metrics(batch=batch, use_critic=self.use_critic))
                 metrics.update(compute_timing_metrics(batch=batch, timing_raw=timing_raw))
                 # TODO: implement actual tflpo and theoretical tflpo
