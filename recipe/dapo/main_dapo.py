@@ -13,6 +13,8 @@
 # limitations under the License.
 """
 Note that we don't combine the main with ray_trainer as ray_trainer is used by other main.
+
+注意这里部分更改对齐了 main_ppo.py, 例如 `actor.strategy in ["fsdp", "fsdp2"]`
 """
 
 import os
@@ -58,33 +60,46 @@ class TaskRunner:
 
         from verl.utils.fs import copy_to_local
 
+        # [MemAgent] Optional remote debugging to align with PPO entry behavior.
+        if os.environ.get("ENABLE_RAY_DEBUGPY", "0") == "1":
+            import debugpy
+
+            host = os.environ.get("DEBUGPY_HOST", "127.0.0.1")
+            port = int(os.environ.get("DEBUGPY_PORT", "5666"))
+            debugpy.listen((host, port))
+            print(f"[debug] TaskRunner waiting for VSCode attach at {host}:{port}")
+            debugpy.wait_for_client()
+
         print(f"TaskRunner hostname: {socket.gethostname()}, PID: {os.getpid()}")
 
         pprint(OmegaConf.to_container(config, resolve=True))  # resolve=True will eval symbol values
         OmegaConf.resolve(config)
 
         # download the checkpoint from hdfs
-        local_path = copy_to_local(config.actor_rollout_ref.model.path)
+        local_path = copy_to_local(config.actor_rollout_ref.model.path, use_shm=config.actor_rollout_ref.model.get("use_shm", False))
 
         # instantiate tokenizer
         from verl.utils import hf_processor, hf_tokenizer
 
-        tokenizer = hf_tokenizer(local_path)
-        processor = hf_processor(local_path, use_fast=True)  # used for multimodal LLM, could be none
+        trust_remote_code = config.data.get("trust_remote_code", False)
+        tokenizer = hf_tokenizer(local_path, trust_remote_code=trust_remote_code)
+        processor = hf_processor(local_path, trust_remote_code=trust_remote_code, use_fast=True)  # used for multimodal LLM, could be none
 
         # define worker classes
-        if config.actor_rollout_ref.actor.strategy == "fsdp":
-            assert config.actor_rollout_ref.actor.strategy == config.critic.strategy
+        if config.actor_rollout_ref.actor.strategy in ["fsdp", "fsdp2"]:
+            assert config.critic.strategy in ["fsdp", "fsdp2"]
             from verl.single_controller.ray import RayWorkerGroup
-            from verl.workers.fsdp_workers import ActorRolloutRefWorker, CriticWorker
+            from verl.workers.fsdp_workers import ActorRolloutRefWorker, AsyncActorRolloutRefWorker, CriticWorker
 
+            actor_rollout_cls = AsyncActorRolloutRefWorker if config.actor_rollout_ref.rollout.mode == "async" else ActorRolloutRefWorker
             ray_worker_group_cls = RayWorkerGroup
 
         elif config.actor_rollout_ref.actor.strategy == "megatron":
             assert config.actor_rollout_ref.actor.strategy == config.critic.strategy
             from verl.single_controller.ray.megatron import NVMegatronRayWorkerGroup
-            from verl.workers.megatron_workers import ActorRolloutRefWorker, CriticWorker
+            from verl.workers.megatron_workers import ActorRolloutRefWorker, AsyncActorRolloutRefWorker, CriticWorker
 
+            actor_rollout_cls = AsyncActorRolloutRefWorker if config.actor_rollout_ref.rollout.mode == "async" else ActorRolloutRefWorker
             ray_worker_group_cls = NVMegatronRayWorkerGroup
 
         else:
@@ -93,7 +108,7 @@ class TaskRunner:
         from verl.trainer.ppo.ray_trainer import ResourcePoolManager, Role
 
         role_worker_mapping = {
-            Role.ActorRollout: ray.remote(ActorRolloutRefWorker),
+            Role.ActorRollout: ray.remote(actor_rollout_cls),
             Role.Critic: ray.remote(CriticWorker),
         }
 
@@ -113,7 +128,7 @@ class TaskRunner:
         # - finally, we combine all the rewards together
         # - The reward type depends on the tag of the data
         if config.reward_model.enable:
-            if config.reward_model.strategy == "fsdp":
+            if config.reward_model.strategy in ["fsdp", "fsdp2"]:
                 from verl.workers.fsdp_workers import RewardModelWorker
             elif config.reward_model.strategy == "megatron":
                 from verl.workers.megatron_workers import RewardModelWorker
@@ -129,9 +144,8 @@ class TaskRunner:
 
         from verl.workers.reward_manager import get_reward_manager_cls
 
-        # Note(haibin.lin): please make sure custom reward managers are imported and
-        # registered via `verl.workers.reward_manager.register`
-        reward_manager_name = config.reward_model.get("reward_manager", "naive")
+        # [MemAgent] Default to DAPO reward manager for easier standalone recipe testing.
+        reward_manager_name = config.reward_model.get("reward_manager", "dapo")
         reward_manager_cls = get_reward_manager_cls(reward_manager_name)
 
         compute_score = get_custom_reward_fn(config)
@@ -155,6 +169,7 @@ class TaskRunner:
         )
         resource_pool_manager = ResourcePoolManager(resource_pool_spec=resource_pool_spec, mapping=mapping)
 
+        # [MemAgent] Dataloader creation (recurrent/non-recurrent) is handled in RayPPOTrainer._create_dataloader.
         trainer = RayDAPOTrainer(
             config=config,
             tokenizer=tokenizer,
