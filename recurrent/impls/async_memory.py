@@ -36,8 +36,8 @@ class AsyncMemoryDataset(RDataset):
         data_config: DictConfig,
         processor: Optional[ProcessorMixin] = None,
     ):
-        if data_config.truncation != 'center':
-            raise ValueError('MemoryDataset only support center truncation')
+        if data_config.truncation != 'middle':
+            raise ValueError('MemoryDataset only support middle truncation')
         chunk_size = recurrent_config.chunk_size
         old_max_chunks = recurrent_config.max_chunks
         old_max_prompt_length = data_config.max_prompt_length
