@@ -464,6 +464,33 @@ class RayDAPOTrainer(RayPPOTrainer):
                         actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
                         metrics.update(actor_output_metrics)
 
+                    # Log rollout generations if enabled
+                    rollout_data_dir = self.config.trainer.get("rollout_data_dir", None)
+                    if rollout_data_dir:
+                        with marked_timer("dump_rollout_generations", timing_raw, color="green"):
+                            from recurrent.utils import clip_long_string
+                            loguru.logger.info(f"[Before Dump] Batch keys: {batch.batch.keys()}")
+                            prompt_token_ids = batch.batch["prompts"].cpu().tolist()
+                            response_token_ids = batch.batch["responses"].cpu().tolist()
+                            total_lens = batch.batch["attention_mask"].sum(-1)   # prompt + response
+                            resp_lens = batch.batch["response_mask"].sum(-1)     # response
+                            prompt_lens = total_lens - resp_lens                 # prompt
+                            prompt_token_ids = [row[-l:] for row, l in zip(prompt_token_ids, prompt_lens)]
+                            response_token_ids = [row[:l] for row, l in zip(response_token_ids, resp_lens)]
+
+                            inputs = self.tokenizer.batch_decode(prompt_token_ids, skip_special_tokens=False)
+                            # *optianal* clip long prompts
+                            inputs = [clip_long_string(i, max_length=4000) for i in inputs]
+                            outputs = self.tokenizer.batch_decode(response_token_ids, skip_special_tokens=False)
+                            scores = batch.batch["token_level_scores"].sum(-1).cpu().tolist()
+                            self._dump_generations(
+                                inputs=inputs,
+                                outputs=outputs,
+                                scores=scores,
+                                reward_extra_infos_dict=reward_extra_infos_dict,
+                                dump_path=rollout_data_dir,
+                            )
+
                     # validate
                     if self.val_reward_fn is not None and self.config.trainer.test_freq > 0 and (is_last_step or self.global_steps % self.config.trainer.test_freq == 0):
                         with marked_timer("testing", timing_raw, "green"):
