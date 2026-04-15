@@ -423,7 +423,10 @@ class RayDAPOTrainer(RayPPOTrainer):
                                 index=reward_batch.non_tensor_batch["uid"],
                                 use_adv=self.config.algorithm.get("norm_adv_by_std_in_grpo", True),
                             )
+                            # broadcast adv & overlong reward
                             advantage_scalar = advantage_scalar[sample_index_batch]
+                            reward_extra_infos_dict = {k: np.asarray(v)[sample_index_batch].tolist() \
+                                                       for k, v in reward_extra_infos_dict.items()}
 
                             response_length = batch.batch["responses"].size(-1)
                             eos_mask = batch.batch["response_mask"]
@@ -464,6 +467,12 @@ class RayDAPOTrainer(RayPPOTrainer):
                         actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
                         metrics.update(actor_output_metrics)
 
+                    # collect metrics
+                    if batch.meta_info.get("padded", False):
+                        # [MemAgent] remove actor-update padding before metrics.
+                        from recurrent.utils import indexing_proto
+                        batch = indexing_proto(batch, batch.batch["no_padding_mask"])
+
                     # Log rollout generations if enabled
                     rollout_data_dir = self.config.trainer.get("rollout_data_dir", None)
                     if rollout_data_dir:
@@ -502,13 +511,6 @@ class RayDAPOTrainer(RayPPOTrainer):
                     if self.config.trainer.save_freq > 0 and (is_last_step or self.global_steps % self.config.trainer.save_freq == 0):
                         with marked_timer("save_checkpoint", timing_raw, "green"):
                             self._save_checkpoint()
-
-                # collect metrics
-                if batch.meta_info.get("padded", False):
-                    # [MemAgent] remove actor-update padding before metrics.
-                    from recurrent.utils import indexing_proto
-
-                    batch = indexing_proto(batch, batch.batch["no_padding_mask"])
 
                 metrics.update(compute_data_metrics(batch=batch, use_critic=self.use_critic))
                 metrics.update(compute_timing_metrics(batch=batch, timing_raw=timing_raw))

@@ -1125,10 +1125,14 @@ class RayPPOTrainer:
                             batch = batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
                             gen_batch = gen_batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
                             gen_batch_output, final_mask, sample_index = self.generation_manager.run_llm_loop(gen_batch, timing_raw)
+                            # [MemAgent][MODIFIED] 广播 uid 用于 filter 过滤
+                            gen_batch_output.non_tensor_batch['uid'] = batch.non_tensor_batch['uid'][sample_index]
 
                             assert final_mask.sum().item() == len(batch.batch), \
                                 "The number of final responses should be equal to the number of prompts." \
                                 f"{len(batch.non_tensor_batch['uid'])} != {len(batch.batch)}"
+                            assert gen_batch_output.batch.batch_size == final_mask.shape == sample_index.shape, \
+                                f"got {gen_batch_output.batch.batch_size=}, {final_mask.shape=}, {sample_index.shape=}"
                             
                             # This is a simplified diagram to show how sample_index works.
                             # DataProto and 2D tensors represented as a list of samples.
@@ -1210,13 +1214,11 @@ class RayPPOTrainer:
                             ##### make sure that samples in indexed proto are in same order as original_batch
                             reward_batch = final_batch(batch, final_mask, sample_index).union(original_batch)
                             reward_tensor, reward_extra_infos_dict = compute_reward(reward_batch, self.reward_fn)
-                            # pad for log_prob
-                            batch, pad_size = pad_dataproto_to_divisor(batch, self.actor_rollout_wg.world_size)
                     
                     # [MemAgent][TODO] 需要检查 dapo filter 逻辑，这里没有走 RayDAPOTrainer
                     # 这里可能有 bug，如果当前 batch 全部被删掉了，后续的流程可能会出问题（比如 log_prob 计算会报错）
                     if self.config.recurrent.enable and self.config.algorithm.get("filter_groups", None):
-                        raise NotImplementedError("filter_groups is not implemented for recurrent yet.") 
+                        # loguru.logger.warning("filter_groups is not implemented for recurrent yet.") 
                         # NOTE: When prompts after filtering is less than train batch size,
                         # we skip to the next generation batch
                         reward_batch.non_tensor_batch["seq_reward"] = reward_tensor.sum(dim=-1).numpy()
@@ -1237,12 +1239,22 @@ class RayPPOTrainer:
                                 kept_traj_idxs.append(idx)
                         kept_traj_idxs = np.array(kept_traj_idxs, dtype=int)
 
+                        if len(kept_traj_idxs) == 0:
+                            loguru.logger.warning(
+                                f"[Filter Groups] It was detected that all the advantages are 0. This step is skipped.")
+                            progress_bar.update(1)
+                            self.global_steps += 1
+                            continue
+
                         batch = batch[kept_traj_idxs]
                         final_mask = final_mask[kept_traj_idxs]
                         sample_index = sample_index[kept_traj_idxs]
                         metrics["train/kept_prompts"] = len(kept_prompt_uids)
                         metrics["train/kept_samples"] = len(kept_traj_idxs)
 
+                    if self.config.recurrent.enable:  ###### [MemAgent]
+                        # pad for log_prob
+                        batch, pad_size = pad_dataproto_to_divisor(batch, self.actor_rollout_wg.world_size)
                     # recompute old_log_probs
                     with marked_timer("old_log_prob", timing_raw, color="blue"):
                         old_log_prob = self.actor_rollout_wg.compute_log_prob(batch)
@@ -1356,7 +1368,7 @@ class RayPPOTrainer:
                             # turns of a sample will have the same final reward, now we mapping turns to samples
                             batch.batch['token_level_scores'] = reward_tensor[sample_index]
 
-                            if not self.config.actor_rollout_ref.actor.get('use_kl_loss', False):
+                            if self.config.actor_rollout_ref.actor.get('use_kl_loss', False):
                                 loguru.logger.warning("KL penalty is not implemented for recurrent.")
                             
                             batch.batch['token_level_rewards'] = batch.batch['token_level_scores']
@@ -1394,6 +1406,10 @@ class RayPPOTrainer:
                             actor_output = self.actor_rollout_wg.update_actor(batch)
                         actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
                         metrics.update(actor_output_metrics)
+                    
+                    if batch.meta_info.get('padded', False):  ##### [MemAgent]
+                        from recurrent.utils import indexing_proto
+                        batch = indexing_proto(batch, batch.batch['no_padding_mask'])
 
                     # Log rollout generations if enabled
                     rollout_data_dir = self.config.trainer.get("rollout_data_dir", None)
@@ -1442,9 +1458,6 @@ class RayPPOTrainer:
                     }
                 )
                 # collect metrics
-                if batch.meta_info.get('padded', False):  ##### [MemAgent]
-                    from recurrent.utils import indexing_proto
-                    batch = indexing_proto(batch, batch.batch['no_padding_mask'])
                 metrics.update(compute_data_metrics(batch=batch, use_critic=self.use_critic))
                 metrics.update(compute_timing_metrics(batch=batch, timing_raw=timing_raw))
                 # TODO: implement actual tflpo and theoretical tflpo
