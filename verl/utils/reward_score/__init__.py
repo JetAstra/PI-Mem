@@ -96,7 +96,7 @@ def default_compute_score(data_source, solution_str, ground_truth, extra_info=No
 
     elif data_source in ['hotpotqa']:
         from . import hotpotqa
-        res = hotpotqa.compute_score(solution_str, ground_truth)
+        res = hotpotqa.compute_score(solution_str, ground_truth, prompt_str)
     else:
         raise NotImplementedError(f"Reward function is not implemented for {data_source=}")
 
