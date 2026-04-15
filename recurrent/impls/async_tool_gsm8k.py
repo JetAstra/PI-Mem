@@ -10,22 +10,31 @@ from recurrent.async_utils import ChatCompletionProxy
 
 from recurrent.interface import AsyncRAgent, RConfig, RDataset, RRegister, AsyncOutput
 from verl.protocol import DataProtoItem
-from verl.trainer.ppo.ray_trainer import _timer
+from recurrent.generation_manager import _timer
 from recurrent.utils import msg, log_step
-from recurrent.tool import ToolSchema, ToolCall, toolcall_system_prompt, toolcall_extract, merge_system_prompt
+from recurrent.tool import (
+    ToolSchema,
+    ToolCall,
+    toolcall_system_prompt,
+    toolcall_extract,
+    merge_system_prompt,
+)
 
 logger = logging.getLogger(__file__)
-logger.setLevel('INFO')
+logger.setLevel("INFO")
+
 
 @dataclass
 class RToolGsm8kConfig(RConfig):
     max_turn: int
     max_generation_per_turn: int
 
+
 class AsyncToolGsm8kAgent(AsyncRAgent):
     """
     This agent works as a simple single-turn agent(standard verl), but its rollout is executed as async recurrent agent.
     """
+
     TOOLS = [
         ToolSchema(
             name="calc_gsm8k_reward",
@@ -42,7 +51,14 @@ class AsyncToolGsm8kAgent(AsyncRAgent):
             },
         )
     ]
-    def __init__(self, proxy: ChatCompletionProxy, tokenizer: PreTrainedTokenizer, config: RConfig, rollout_config: DictConfig):
+
+    def __init__(
+        self,
+        proxy: ChatCompletionProxy,
+        tokenizer: PreTrainedTokenizer,
+        config: RConfig,
+        rollout_config: DictConfig,
+    ):
         self.system_msg = toolcall_system_prompt(self.TOOLS)
         super().__init__(proxy, tokenizer, config, rollout_config)
 
@@ -54,9 +70,15 @@ class AsyncToolGsm8kAgent(AsyncRAgent):
             if not isinstance(answer, str):
                 answer = str(answer)
             from verl.utils.reward_score.gsm8k import compute_score
-            # keep align with Sglang's demo in verl, 
+
+            # keep align with Sglang's demo in verl,
             # can also use a customized dataset to simplify the code.
-            reward = compute_score(answer, gen_item.non_tensor_batch["tools_kwargs"]["calc_gsm8k_reward"]["create_kwargs"]["ground_truth"])
+            reward = compute_score(
+                answer,
+                gen_item.non_tensor_batch["tools_kwargs"]["calc_gsm8k_reward"][
+                    "create_kwargs"
+                ]["ground_truth"],
+            )
             return {"role": "tool", "content": f"Current parsed {answer=} {reward=}"}
         elif parsed.name == ToolSchema.INVALID_TOOL:
             return {"role": "tool", "content": f"{parsed.args['msg']}"}
@@ -66,18 +88,19 @@ class AsyncToolGsm8kAgent(AsyncRAgent):
     @override
     async def rollout(self, gen_item: DataProtoItem) -> AsyncOutput:
         timing_raw = {}
-        sample_index = gen_item.batch['sample_index'].item()
+        sample_index = gen_item.batch["sample_index"].item()
         kwargs = self.sampling_params(gen_item.meta_info)
         kwargs["max_completion_tokens"] = self.config.max_generation_per_turn
         kwargs["stop"] = ["</tool_call>"]
         if sample_index == 0:
             logger.info(f"generate_sequences sampling params: {kwargs}")
 
-        conversation = merge_system_prompt(list(gen_item.non_tensor_batch["raw_prompt"]), self.system_msg)
-        with _timer('mt_async_gen', timing_raw):
+        conversation = merge_system_prompt(
+            list(gen_item.non_tensor_batch["raw_prompt"]), self.system_msg
+        )
+        with _timer("mt_async_gen", timing_raw):
             completions, err = await self.proxy.get_chat_completions(
-                messages = conversation,
-                **kwargs
+                messages=conversation, **kwargs
             )
         if err:
             raise err
@@ -93,10 +116,9 @@ class AsyncToolGsm8kAgent(AsyncRAgent):
                 break
             tool_msg = await self.tool_message(gen_item, parsed)
             conversation.append(tool_msg)
-            with _timer('mt_async_gen', timing_raw):
+            with _timer("mt_async_gen", timing_raw):
                 completions, err = await self.proxy.get_chat_completions(
-                    messages = conversation,
-                    **kwargs
+                    messages=conversation, **kwargs
                 )
             if err:
                 raise err
@@ -105,14 +127,15 @@ class AsyncToolGsm8kAgent(AsyncRAgent):
             step += 1
             if sample_index == 0:
                 log_step(logger, step, conversation[-2:])
-            
+
         sample_index = torch.tensor([sample_index], dtype=torch.long)
         final_mask = torch.tensor([True], dtype=torch.bool)
         metric = {"workflow/tool_call": step}
         return AsyncOutput([conversation], sample_index, final_mask, timing_raw, metric)
 
-    
-    
+
 # Important, we will import `REGISTER` from this file to get all registered classes.
 # specified by recurrent.async_path / recurrent.async_path
-REGISTER = RRegister(config_cls=RToolGsm8kConfig, dataset_cls=RDataset, agent_cls=AsyncToolGsm8kAgent)
+REGISTER = RRegister(
+    config_cls=RToolGsm8kConfig, dataset_cls=RDataset, agent_cls=AsyncToolGsm8kAgent
+)

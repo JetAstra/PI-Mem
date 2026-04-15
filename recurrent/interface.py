@@ -32,7 +32,9 @@ class RConfig:
     Configuration for Multi-turn Policy Optimization.
     Just an interface. Add anything you need in a subclass of it.
     """
+
     pass
+
 
 class RDataset(RLHFDataset):
     """
@@ -44,10 +46,11 @@ class RDataset(RLHFDataset):
         - __getitem__: get a single sample
         - get_batch_keys: tensor keys and non-tensor keys, should be contained in the batch.
         - get_collate_fn: collate function for dataloader, default to the same as RLHFDataset.
-    
-    The inherited methods are hdfs/parquet related methods. 
+
+    The inherited methods are hdfs/parquet related methods.
     Make sure to call super().__init__() in your subclass to reuse RLHFDataset's initializer.
     """
+
     def __init__(
         self,
         recurrent_config: RConfig,
@@ -56,7 +59,12 @@ class RDataset(RLHFDataset):
         data_config: DictConfig,
         processor: Optional[ProcessorMixin] = None,
     ):
-        super().__init__(data_files=data_files, tokenizer=tokenizer, config=data_config, processor=processor)
+        super().__init__(
+            data_files=data_files,
+            tokenizer=tokenizer,
+            config=data_config,
+            processor=processor,
+        )
 
     def __getitem__(self, item) -> dict:
         """
@@ -68,7 +76,6 @@ class RDataset(RLHFDataset):
         row_dict["sample_uuid"] = str(uuid4())
         return row_dict
 
-
     def get_bactch_keys(self) -> tuple[list[str], list[str]]:
         return ["input_ids", "attention_mask", "position_ids"], []
 
@@ -76,15 +83,19 @@ class RDataset(RLHFDataset):
     def get_collate_fn():
         return collate_fn
 
+
 from .async_utils import ChatCompletionProxy
 
+
 class AsyncOutput(ABC):
-    def __init__(self, 
-                 conversations: List[List[Dict[str, str]]], 
-                 sample_index: int, 
-                 final_mask: bool,
-                 timing_raw: dict,
-                 metrics: dict = None):
+    def __init__(
+        self,
+        conversations: List[List[Dict[str, str]]],
+        sample_index: int,
+        final_mask: bool,
+        timing_raw: dict,
+        metrics: dict = None,
+    ):
         self.conversations = conversations
         self.sample_index = sample_index
         self.final_mask = final_mask
@@ -94,7 +105,8 @@ class AsyncOutput(ABC):
         self.metrics = metrics
         if "workflow/num_conv" not in metrics:
             metrics["workflow/num_conv"] = len(conversations)
-    
+
+
 class AsyncRAgent(ABC):
     """
     An async recurrent agent interface.
@@ -104,7 +116,14 @@ class AsyncRAgent(ABC):
     3. How to prompt LLM / How to process generated response / When to stop (rollout)
     > note that you should focus on a SINGLE sample instead of a group or a batch.
     """
-    def __init__(self, proxy: ChatCompletionProxy, tokenizer:PreTrainedTokenizer, config: RConfig, rollout_config: DictConfig):
+
+    def __init__(
+        self,
+        proxy: ChatCompletionProxy,
+        tokenizer: PreTrainedTokenizer,
+        config: RConfig,
+        rollout_config: DictConfig,
+    ):
         self.proxy = proxy
         self.tokenizer = tokenizer
         self.config = config
@@ -114,9 +133,9 @@ class AsyncRAgent(ABC):
     # If you need to initialize/clean up some resource, override this two methods.
     def start(self, gen_batch: DataProto, timing_raw: dict):
         pass
+
     def end(self):
         pass
-        
 
     @abstractmethod
     async def rollout(self, gen_item: DataProtoItem) -> AsyncOutput:
@@ -124,7 +143,7 @@ class AsyncRAgent(ABC):
         Rollout a single sample, returns conversations/sample_index/final_mask + timing/metrics...
         """
         pass
-    
+
     def sampling_params(self, meta_info):
         """
         Adapted from works/rollout/vllm_spmd_rollout, returns topp/temperature/n for generation
@@ -132,32 +151,35 @@ class AsyncRAgent(ABC):
         Also notice that top_k is not supported in async mode
         """
         kwargs = dict(
-                n=1,
-                temperature=self.rollout_config.temperature,
-                top_p=self.rollout_config.top_p,
-            )
+            n=1,
+            temperature=self.rollout_config.temperature,
+            top_p=self.rollout_config.top_p,
+        )
         do_sample = meta_info.get("do_sample", True)
         is_validate = meta_info.get("validate", False)
         if not do_sample:
-                # logger.info(f"original {kwargs=}, updating becase do_sample is False")
-            kwargs.update({
-                    'best_of': 1,
-                    'top_p': 1.0,
-                    'min_p': 0.0,
-                    'temperature': 0,
-                    'n': 1  # if greedy, only 1 response
-                })
+            # logger.info(f"original {kwargs=}, updating becase do_sample is False")
+            kwargs.update(
+                {
+                    "best_of": 1,
+                    "top_p": 1.0,
+                    "min_p": 0.0,
+                    "temperature": 0,
+                    "n": 1,  # if greedy, only 1 response
+                }
+            )
         elif is_validate:
-                # logger.info(f"original {kwargs=}, updating because is_validate is True")
-                # TODO: try **
-            kwargs.update({
-                    'top_p': self.rollout_config.val_kwargs.top_p,
-                    'temperature': self.rollout_config.val_kwargs.temperature,
-                    'n': 1,  # if validate, already repeat in ray_trainer
-                })
-            
-        return kwargs
+            # logger.info(f"original {kwargs=}, updating because is_validate is True")
+            # TODO: try **
+            kwargs.update(
+                {
+                    "top_p": self.rollout_config.val_kwargs.top_p,
+                    "temperature": self.rollout_config.val_kwargs.temperature,
+                    "n": 1,  # if validate, already repeat in ray_trainer
+                }
+            )
 
+        return kwargs
 
     def reduce_timings(self, timing_raws: list[dict]) -> dict:
         """
@@ -169,7 +191,9 @@ class AsyncRAgent(ABC):
         for k in timing_raws[0]:
             if "async" in k:
                 # async method can be executed parallelly
-                reduced[k] = sum([timing_raw[k] for timing_raw in timing_raws]) / len(timing_raws)
+                reduced[k] = sum([timing_raw[k] for timing_raw in timing_raws]) / len(
+                    timing_raws
+                )
             else:
                 # sync method is executed sequentially
                 reduced[k] = sum([timing_raw[k] for timing_raw in timing_raws])
@@ -182,6 +206,7 @@ class AsyncRAgent(ABC):
             reduced[k + "_min"] = np.min([m[k] for m in metrics])
             reduced[k + "_max"] = np.max([m[k] for m in metrics])
         return reduced
+
 
 class RAgent(ABC):
     """
@@ -197,9 +222,11 @@ class RAgent(ABC):
     All methods are marked as abstract, they WILL NOT be called by default and are just a hint
     about how it should be implemented.
     """
+
     @abstractmethod
-    def __init__(self, tokenizer:PreTrainedTokenizer, config: RConfig):
+    def __init__(self, tokenizer: PreTrainedTokenizer, config: RConfig):
         pass
+
     @abstractmethod
     def start(self, gen_batch: DataProto, timing_raw: dict):
         """
@@ -209,9 +236,14 @@ class RAgent(ABC):
         self.gen_batch = gen_batch
         self.timing_raw = timing_raw
         self.step = 0
-        self.final_mask_list = [] # only the final turn will be verified, used for reward compute
-        self.sample_index_list = [] # map each turn to the sample id in the original batch
+        self.final_mask_list = (
+            []
+        )  # only the final turn will be verified, used for reward compute
+        self.sample_index_list = (
+            []
+        )  # map each turn to the sample id in the original batch
         pass
+
     @abstractmethod
     def action(self) -> tuple[list[torch.Tensor], dict]:
         """
@@ -226,22 +258,27 @@ class RAgent(ABC):
         """
         sample_index = torch.arange(len(self.gen_batch), dtype=torch.long)
         self.sample_index_list.append(sample_index)
-        self.final_mask_list.append(torch.full(sample_index.shape, False, dtype=torch.bool))
+        self.final_mask_list.append(
+            torch.full(sample_index.shape, False, dtype=torch.bool)
+        )
         pass
+
     @abstractmethod
     def update(self, gen_output: DataProto) -> DataProto:
         """
         Called once after rollout, agent can execute tool calling or other custom action, and update agent state.
-        
+
         e.g. CodeAgnet will terminate the generation loop if there is no code within ```python```.
         """
         pass
+
     @abstractmethod
     def done(self):
         """
         Whether the generation loop should stop.
         """
         return False
+
     @abstractmethod
     def end(self) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
         """
@@ -260,20 +297,24 @@ class RAgent(ABC):
         del self.sample_index_list
         return final_mask, sample_index
 
+
 @dataclass
 class RRegister:
-    """Register your custom recurrent implementation with this class. The register object will be used to create these classes.
-    """
+    """Register your custom recurrent implementation with this class. The register object will be used to create these classes."""
+
     config_cls: Type[RConfig]
     dataset_cls: Type[RDataset]
     agent_cls: Type[RAgent]
 
     @classmethod
-    def from_filename(cls, file_path: str, obj_name: str) -> 'RRegister':
+    def from_filename(cls, file_path: str, obj_name: str) -> "RRegister":
         import importlib.util
         import os
+
         if not os.path.exists(file_path):
-            raise FileNotFoundError(f"Recurrent implementation file '{file_path}' not found.")
+            raise FileNotFoundError(
+                f"Recurrent implementation file '{file_path}' not found."
+            )
 
         spec = importlib.util.spec_from_file_location("custom_module", file_path)
         if not spec:
@@ -285,11 +326,16 @@ class RRegister:
             raise RuntimeError(f"Error loading module from '{file_path}': {e}")
 
         if not hasattr(module, obj_name):
-            raise AttributeError(f"Register object '{obj_name}' not found in '{file_path}'.")
+            raise AttributeError(
+                f"Register object '{obj_name}' not found in '{file_path}'."
+            )
 
         obj = getattr(module, obj_name)
         if not isinstance(obj, cls):
-            raise TypeError(f"Object '{obj_name}' in '{file_path}' is not an instance of {cls}.")
-        print(f"[RECURRENT] recurrent enabled, using register '{obj_name}' from '{file_path}'.")
+            raise TypeError(
+                f"Object '{obj_name}' in '{file_path}' is not an instance of {cls}."
+            )
+        print(
+            f"[RECURRENT] recurrent enabled, using register '{obj_name}' from '{file_path}'."
+        )
         return obj
-
