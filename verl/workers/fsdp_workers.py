@@ -231,6 +231,8 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         self._is_actor = self.role in ["actor", "actor_rollout", "actor_rollout_ref"]
         self._is_rollout = self.role in ["rollout", "actor_rollout", "actor_rollout_ref"]
         self._is_ref = self.role in ["ref", "actor_rollout_ref"]
+        # Recurrent multi-turn can keep one rollout sharding-manager session across turns.
+        self._rollout_session_active = False
 
         profiler_config: Optional[ProfilerConfig] = None
         if self._is_actor:
@@ -752,8 +754,26 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
     @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
     @DistProfiler.annotate(color="red")
+    def rollout_session_begin(self, _: DataProto):
+        assert self._is_rollout
+        if not self._rollout_session_active:
+            self.rollout_sharding_manager.__enter__()
+            self._rollout_session_active = True
+        return DataProto()
+
+    @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
+    @DistProfiler.annotate(color="red")
+    def rollout_session_end(self, _: DataProto):
+        assert self._is_rollout
+        if self._rollout_session_active:
+            self.rollout_sharding_manager.__exit__(None, None, None)
+            self._rollout_session_active = False
+        return DataProto()
+
+    @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
+    @DistProfiler.annotate(color="red")
     def generate_sequences(self, prompts: DataProto):
-        # ray_debug_break("generate_sequences:entry", port=5667)
+        ray_debug_break("generate_sequences:entry", port=5667)
         # Support all hardwares
         if torch.distributed.get_rank() == 0:
             logger.info(f"{_now()} fsdp_workers generate_sequences")
@@ -767,23 +787,25 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         }
         prompts.meta_info.update(meta_info)
         timing_generate = {}
-        with self.rollout_sharding_manager:
-            log_gpu_memory_usage("After entering rollout sharding manager", logger=logger)
+        if not self._rollout_session_active:
+            raise RuntimeError("generate_sequences is only allowed in recurrent session. Please call rollout_session_begin/end around multi-turn rollout.")
 
-            prompts = self.rollout_sharding_manager.preprocess_data(prompts)
-            ######
-            # [MemAgent] MODIFY: apply pad_to and generation_kwargs
-            ######
-            with simple_timer("generate_sequences", timing_generate):
-                output = self.rollout.generate_sequences(
-                    prompts=prompts, pad_to=prompts.meta_info.get("pad_to", None),
-                    **prompts.meta_info.get("generation_kwargs", {}))
+        log_gpu_memory_usage("After entering rollout sharding manager", logger=logger)
 
-            log_gpu_memory_usage("After rollout generation", logger=logger)
+        prompts = self.rollout_sharding_manager.preprocess_data(prompts)
+        ######
+        # [MemAgent] MODIFY: apply pad_to and generation_kwargs
+        ######
+        with simple_timer("generate_sequences", timing_generate):
+            output = self.rollout.generate_sequences(
+                prompts=prompts, pad_to=prompts.meta_info.get("pad_to", None),
+                **prompts.meta_info.get("generation_kwargs", {}))
 
-            output = self.rollout_sharding_manager.postprocess_data(output)
-            if torch.distributed.get_rank() == 0:
-                logger.info(f"{_now()} data postprocessed")
+        log_gpu_memory_usage("After rollout generation", logger=logger)
+
+        output = self.rollout_sharding_manager.postprocess_data(output)
+        if torch.distributed.get_rank() == 0:
+            logger.info(f"{_now()} data postprocessed")
         if torch.distributed.get_rank() == 0:
             logger.info(f"{_now()} left rollout sharding manager")
 
@@ -795,7 +817,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         output = output.to("cpu")
 
         # clear kv cache
-        get_torch_device().empty_cache()
+        # get_torch_device().empty_cache()
         return output
 
     @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)

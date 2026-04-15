@@ -154,34 +154,40 @@ class LLMGenerationManager:
         )  #  do_sample, is_validate, eos/pad are stored in here.
         pad_token_id = self.tokenizer.pad_token_id
         self.agent.start(gen_batch, timing_raw)
-        # Main generation loop, agent should indicate whether to stop
-        while not self.agent.done():
-            with _timer("mt_prepare", timing_raw):
-                messages, meta_info_gen = self.agent.action()
-                meta_info_gen.update(meta_info)
-                # [len(x) for x in messages] == [len(x[x!=pad_token_id]) for x in input_ids]
-                # torch.all(attention_masks.sum(-1) == torch.tensor([len(x[x!=pad_token_id]) for x in input_ids]))
-                input_ids = pad_tensor_list_to_length(
-                    messages,
-                    pad_token_id=pad_token_id,
-                    max_length=meta_info_gen["input_pad_to"],
-                    left_pad=True,
-                )
-                attention_masks = create_attention_mask(
-                    input_ids, pad_token_id=pad_token_id
-                )
-                position_ids = create_position_ids(attention_masks)
-                active_num_list.append(len(messages))
-                logger.info("padding done")
-            with _timer("mt_gen", timing_raw):
-                gen_output = self.generate_with_graceful_padding(
-                    input_ids, attention_masks, position_ids, meta_info_gen
-                )
-                logger.info("generation done")
-            with _timer("mt_update", timing_raw):
-                gen_output = self.agent.update(gen_output)
-                gen_output_list.append(gen_output)
-                logger.info("agent update done")
+
+        empty_proto = DataProto()
+        self.actor_rollout_wg.rollout_session_begin(empty_proto)
+        try:
+            # Main generation loop, agent should indicate whether to stop
+            while not self.agent.done():
+                with _timer("mt_prepare", timing_raw):
+                    messages, meta_info_gen = self.agent.action()
+                    meta_info_gen.update(meta_info)
+                    # [len(x) for x in messages] == [len(x[x!=pad_token_id]) for x in input_ids]
+                    # torch.all(attention_masks.sum(-1) == torch.tensor([len(x[x!=pad_token_id]) for x in input_ids]))
+                    input_ids = pad_tensor_list_to_length(
+                        messages,
+                        pad_token_id=pad_token_id,
+                        max_length=meta_info_gen["input_pad_to"],
+                        left_pad=True,
+                    )
+                    attention_masks = create_attention_mask(
+                        input_ids, pad_token_id=pad_token_id
+                    )
+                    position_ids = create_position_ids(attention_masks)
+                    active_num_list.append(len(messages))
+                    logger.info("padding done")
+                with _timer("mt_gen", timing_raw):
+                    gen_output = self.generate_with_graceful_padding(
+                        input_ids, attention_masks, position_ids, meta_info_gen
+                    )
+                    logger.info("generation done")
+                with _timer("mt_update", timing_raw):
+                    gen_output = self.agent.update(gen_output)
+                    gen_output_list.append(gen_output)
+                    logger.info("agent update done")
+        finally:
+            self.actor_rollout_wg.rollout_session_end(empty_proto)
         final_mask, sample_index = self.agent.end()
 
         # OK, now we've got all we need in gen_output_list, and the final_mask indicates which one is final answer.
