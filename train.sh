@@ -2,7 +2,7 @@
 export PROJ_DIR="/mnt/shared-storage-user/dllm-share/liudawei/verl"
 cd "${PROJ_DIR}"
 source /mnt/shared-storage-user/liudawei/miniforge3/etc/profile.d/conda.sh
-conda activate /mnt/shared-storage-user/dllm-share/songhaixu/miniforge3/envs/qwenlongl1_5_debug
+conda activate /mnt/shared-storage-user/dllm-share/songhaixu/miniforge3/envs/qwenlongl1_5
 export PYTHONPATH="/mnt/shared-storage-user/dllm-share/liudawei/verl"
 
 which python
@@ -16,7 +16,7 @@ export WANDB_PROJECT="QwenLong-L1.5"
 export LLM_JUDGE=Y
 export VLLM_ATTENTION_BACKEND=FLASH_ATTN
 export VERIFIER_PATH="/mnt/shared-storage-user/dllm-share/Models/Qwen2_2.5/Qwen2.5-7B-Instruct/"
-export VERIFIER_HOST="100.97.88.236"
+export VERIFIER_HOST="100.97.88.235"
 export VERIFIER_PORT="23547"
 
 

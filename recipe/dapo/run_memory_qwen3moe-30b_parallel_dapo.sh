@@ -4,8 +4,9 @@ set -x
 set -e
 # source /mnt/shared-storage-user/liudawei/miniforge3/etc/profile.d/conda.sh
 # conda activate /mnt/shared-storage-user/dllm-share/songhaixu/miniforge3/envs/qwenlongl1_5
-echo $(which python)
+
 cd /mnt/shared-storage-user/dllm-share/liudawei/verl/
+echo "$(which python)"
 
 export LLM_JUDGE=Y
 export VERIFIER_PATH=/mnt/shared-storage-user/dllm-share/Models/Qwen2_2.5/Qwen2.5-32B-Instruct/
@@ -29,11 +30,10 @@ NNODES=4
 NGPUS_PER_NODE=8
 PROJ_ROOT=/mnt/shared-storage-user/liudawei/songhaixu/checkpoints
 
-# MODEL_PATH=/mnt/shared-storage-user/dllm-share/Models/Qwen3/Qwen3-30B-A3B
-MODEL_PATH=/mnt/shared-storage-user/liudawei/songhaixu/checkpoints/QwenLong-L1-8GPU-4nodes-Rayjob-MemAgent/ckpt/global_step_10/actor/huggingface
+MODEL_PATH=/mnt/shared-storage-user/dllm-share/Models/Qwen3/Qwen3-30B-A3B
 TRAIN_PATH="/mnt/shared-storage-user/dllm-share/liudawei/verl/data/hotpotqa/hotpotqa_train_32k.parquet"
 VAL_PATH="/mnt/shared-storage-user/dllm-share/liudawei/verl/data/hotpotqa/hotpotqa_dev.parquet"
-EXPERIMENT_NAME="QwenLong-L1-8GPU-4nodes-Rayjob-MemAgent-resume"
+EXPERIMENT_NAME="Qwen3-30BA3B-8GPU-4nodes-parallel-dapo"
 mkdir -p "${PROJ_ROOT}/${EXPERIMENT_NAME}"
 
 # Please note that recurrent framewrok will use max_length defined in task config.
@@ -42,15 +42,18 @@ MAXLEN=32000
 CHUNK_SIZE=8000
 MAX_NEW_TOKEN=4000
 MEMORY_LEN=4000
+MERGE_LEN=8000
 
 # export HYDRA_FULL_ERROR=1
 # recurrent.memory.config.max_prompt_length 只有一小段 query 长度
 python -u -m recipe.dapo.main_dapo \
     recurrent.enable=memory \
     recurrent.memory.config.chunk_size=$CHUNK_SIZE \
-    recurrent.memory.config.max_prompt_length=1024 \
+    recurrent.memory.config.max_prompt_length=512 \
     recurrent.memory.config.max_memorization_length=$MEMORY_LEN \
     recurrent.memory.config.max_final_response_length=$MAX_NEW_TOKEN \
+    recurrent.memory.config.max_passes=2 \
+    recurrent.memory.config.max_merge_length=$MERGE_LEN \
     data.train_files=$TRAIN_PATH \
     data.val_files=$VAL_PATH \
     data.truncation='middle' \

@@ -546,15 +546,16 @@ class MemoryAgent(RAgent):
             return
 
         if show_idx < len(self.messages):
-            decoded_message = self.tokenizer.decode(self.messages[show_idx])
-            rsp0 = gen_output.batch["responses"][show_idx]
-            decoded_response = self.tokenizer.decode(
-                rsp0[rsp0 != self.tokenizer.pad_token_id]
-            )
-            logger.info(f"[MESSAGE] {clip_long_string(decoded_message)}")
-            logger.info(f"{' ' * 10}{'-' * 20}prompt end{'-' * 20}{' ' * 10}")
-            logger.info(f"[RESPONSE] {decoded_response}")
-            logger.info(f"{' ' * 10}{'-' * 20}response end{'-' * 20}{' ' * 10}")
+            pass
+            # decoded_message = self.tokenizer.decode(self.messages[show_idx])
+            # rsp0 = gen_output.batch["responses"][show_idx]
+            # decoded_response = self.tokenizer.decode(
+            #     rsp0[rsp0 != self.tokenizer.pad_token_id]
+            # )
+            # logger.info(f"[MESSAGE] {clip_long_string(decoded_message)}")
+            # logger.info(f"{' ' * 10}{'-' * 20}prompt end{'-' * 20}{' ' * 10}")
+            # logger.info(f"[RESPONSE] {decoded_response}")
+            # logger.info(f"{' ' * 10}{'-' * 20}response end{'-' * 20}{' ' * 10}")
 
 
 # Important, we will import `REGISTER` from this file to get all registered classes.

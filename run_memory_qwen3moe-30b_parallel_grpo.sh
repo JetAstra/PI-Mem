@@ -1,17 +1,17 @@
 #!/bin/bash
-# bash /mnt/shared-storage-user/dllm-share/liudawei/verl/recipe/dapo/run_memory_qwen3moe-30b_dapo.sh
+# bash /mnt/shared-storage-user/dllm-share/liudawei/verl/run_memory_qwen3moe-30b_parallel_grpo.sh
 set -x
 set -e
-# source /mnt/shared-storage-user/liudawei/miniforge3/etc/profile.d/conda.sh
-# conda activate /mnt/shared-storage-user/dllm-share/songhaixu/miniforge3/envs/qwenlongl1_5
-echo $(which python)
+source /mnt/shared-storage-user/liudawei/miniforge3/etc/profile.d/conda.sh
+conda activate /mnt/shared-storage-user/dllm-share/songhaixu/miniforge3/envs/qwenlongl1_5
+
 cd /mnt/shared-storage-user/dllm-share/liudawei/verl/
+echo "$(which python)"
 
 export LLM_JUDGE=Y
 export VERIFIER_PATH=/mnt/shared-storage-user/dllm-share/Models/Qwen2_2.5/Qwen2.5-32B-Instruct/
 export VERIFIER_HOST=100.97.88.235
 export VERIFIER_PORT=23547
-
 
 export WANDB_MODE=offline
 export WANDB_DIR="/mnt/shared-storage-user/dllm-share/liudawei/verl/"
@@ -29,11 +29,10 @@ NNODES=4
 NGPUS_PER_NODE=8
 PROJ_ROOT=/mnt/shared-storage-user/liudawei/songhaixu/checkpoints
 
-# MODEL_PATH=/mnt/shared-storage-user/dllm-share/Models/Qwen3/Qwen3-30B-A3B
-MODEL_PATH=/mnt/shared-storage-user/liudawei/songhaixu/checkpoints/QwenLong-L1-8GPU-4nodes-Rayjob-MemAgent/ckpt/global_step_10/actor/huggingface
+MODEL_PATH=/mnt/shared-storage-user/dllm-share/Models/Qwen3/Qwen3-30B-A3B
 TRAIN_PATH="/mnt/shared-storage-user/dllm-share/liudawei/verl/data/hotpotqa/hotpotqa_train_32k.parquet"
 VAL_PATH="/mnt/shared-storage-user/dllm-share/liudawei/verl/data/hotpotqa/hotpotqa_dev.parquet"
-EXPERIMENT_NAME="QwenLong-L1-8GPU-4nodes-Rayjob-MemAgent-resume"
+EXPERIMENT_NAME="Qwen3-30BA3B-8GPU-4nodes-parallel-grpo"
 mkdir -p "${PROJ_ROOT}/${EXPERIMENT_NAME}"
 
 # Please note that recurrent framewrok will use max_length defined in task config.
@@ -42,15 +41,19 @@ MAXLEN=32000
 CHUNK_SIZE=8000
 MAX_NEW_TOKEN=4000
 MEMORY_LEN=4000
+MERGE_LEN=8000
 
 # export HYDRA_FULL_ERROR=1
 # recurrent.memory.config.max_prompt_length 只有一小段 query 长度
-python -u -m recipe.dapo.main_dapo \
+# main_ppo 的 overlong cfg 传不进去，可能要改代码
+python -u -m verl.trainer.main_ppo \
     recurrent.enable=memory \
     recurrent.memory.config.chunk_size=$CHUNK_SIZE \
-    recurrent.memory.config.max_prompt_length=1024 \
+    recurrent.memory.config.max_prompt_length=512 \
     recurrent.memory.config.max_memorization_length=$MEMORY_LEN \
     recurrent.memory.config.max_final_response_length=$MAX_NEW_TOKEN \
+    recurrent.memory.config.max_passes=3 \
+    recurrent.memory.config.max_merge_length=$MERGE_LEN \
     data.train_files=$TRAIN_PATH \
     data.val_files=$VAL_PATH \
     data.truncation='middle' \
@@ -58,7 +61,6 @@ python -u -m recipe.dapo.main_dapo \
     +data.context_key='context' \
     data.filter_overlong_prompts_workers=96 \
     data.filter_overlong_prompts=True \
-    data.gen_batch_size=384 \
     data.train_batch_size=128 \
     data.max_prompt_length=$MAXLEN \
     data.max_response_length=$MAX_NEW_TOKEN \
@@ -71,14 +73,12 @@ python -u -m recipe.dapo.main_dapo \
     actor_rollout_ref.actor.kl_loss_coef=0.000 \
     actor_rollout_ref.actor.clip_ratio_low=0.2 \
     actor_rollout_ref.actor.clip_ratio_high=0.2 \
-    algorithm.filter_groups.enable=True \
-    algorithm.filter_groups.max_num_gen_batches=10 \
-    algorithm.filter_groups.metric=seq_reward \
+    +algorithm.filter_groups.enable=True \
     actor_rollout_ref.model.use_remove_padding=True \
     actor_rollout_ref.actor.use_dynamic_bsz=True \
     actor_rollout_ref.ref.log_prob_use_dynamic_bsz=True \
     actor_rollout_ref.rollout.log_prob_use_dynamic_bsz=True \
-    actor_rollout_ref.actor.ppo_max_token_len_per_gpu=28000 \
+    actor_rollout_ref.actor.ppo_max_token_len_per_gpu=25000 \
     actor_rollout_ref.ref.log_prob_max_token_len_per_gpu=102400 \
     actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu=102400 \
     actor_rollout_ref.model.path=$MODEL_PATH \
@@ -87,11 +87,11 @@ python -u -m recipe.dapo.main_dapo \
     actor_rollout_ref.actor.entropy_coeff=0.0 \
     actor_rollout_ref.actor.ppo_epochs=1 \
     actor_rollout_ref.actor.ppo_mini_batch_size=32 \
-    actor_rollout_ref.actor.fsdp_config.param_offload=True \
+    actor_rollout_ref.actor.fsdp_config.param_offload=False \
     actor_rollout_ref.actor.fsdp_config.optimizer_offload=True \
-    actor_rollout_ref.actor.ulysses_sequence_parallel_size=8 \
+    actor_rollout_ref.actor.ulysses_sequence_parallel_size=2 \
     actor_rollout_ref.rollout.gpu_memory_utilization=0.85 \
-    actor_rollout_ref.rollout.tensor_model_parallel_size=4 \
+    actor_rollout_ref.rollout.tensor_model_parallel_size=2 \
     actor_rollout_ref.rollout.enable_chunked_prefill=True \
     actor_rollout_ref.rollout.enforce_eager=True \
     actor_rollout_ref.rollout.free_cache_engine=True \
@@ -105,14 +105,10 @@ python -u -m recipe.dapo.main_dapo \
     actor_rollout_ref.rollout.val_kwargs.temperature=0.7 \
     actor_rollout_ref.rollout.val_kwargs.n=1 \
     actor_rollout_ref.ref.fsdp_config.param_offload=True \
-    actor_rollout_ref.ref.ulysses_sequence_parallel_size=4 \
-    actor_rollout_ref.actor.checkpoint.save_contents=['model','hf_model','optimizer','extra'] \
+    actor_rollout_ref.ref.ulysses_sequence_parallel_size=2 \
+)    actor_rollout_ref.actor.checkpoint.save_contents=['model','hf_model','optimizer','extra'] \
     actor_rollout_ref.model.use_liger=True \
     reward_model.reward_manager='dapo_parallel' \
-    reward_model.overlong_buffer.enable=True \
-    reward_model.overlong_buffer.len=1000 \
-    reward_model.overlong_buffer.penalty_factor=1.0 \
-    reward_model.overlong_buffer.log=True \
     trainer.logger=['console','wandb'] \
     trainer.project_name='QwenLong-L1-MemAgent' \
     trainer.experiment_name=${EXPERIMENT_NAME} \

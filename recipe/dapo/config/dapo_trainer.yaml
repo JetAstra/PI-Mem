@@ -13,7 +13,7 @@ reward_model:
   reward_manager: dapo
   overlong_buffer: 
     enable: False # We try to avoid forgetting to set enable
-    len: 0
+    len: 0  # 这里是缓冲区大小 (超出 max_resp_len - overlong_buffer_len 才会惩罚)
     penalty_factor: 0.0
     log: False
 
