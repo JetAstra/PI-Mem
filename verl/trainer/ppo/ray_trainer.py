@@ -62,6 +62,7 @@ import loguru
 
 WorkerType = Type[Worker]
 
+import verl; print(f"[==检查verl位置==] {verl=}")
 
 class Role(Enum):
     """
@@ -317,6 +318,63 @@ def compute_1D_grpo_advantage(token_level_rewards: torch.Tensor,
             else:
                 scores[i] = scores[i] - id2mean[index[i]]
     return scores
+
+
+def apply_pass_reward_bonus(
+    reward_tensor: torch.Tensor,
+    reward_batch: DataProto,
+    recurrent_config,
+    reward_extra_infos_dict: Optional[dict] = None,
+) -> tuple[torch.Tensor, dict]:
+    """
+    Add sequence-level bonus on final answers: fewer used passes => higher bonus.
+    If pass_used == max_passes, bonus is 0.
+    """
+    coef = float(getattr(recurrent_config, "pass_reward_coef", 0.0) or 0.0)
+    if coef <= 0 or "pass_used" not in reward_batch.non_tensor_batch:
+        return reward_tensor, {}
+
+    max_passes = int(getattr(recurrent_config, "max_passes", 0) or 0)
+    if max_passes <= 1:
+        return reward_tensor, {}
+
+    pass_used = torch.as_tensor(reward_batch.non_tensor_batch["pass_used"], device=reward_tensor.device, dtype=torch.long)
+    # pass=1 -> 1.0, pass=max_passes -> 0.0
+    pass_bonus = (max_passes - pass_used).clamp(min=0).to(reward_tensor.dtype) / (max_passes - 1)
+    pass_bonus = pass_bonus * coef
+
+    # Only apply pass bonus to correct samples.
+    correct_mask = None
+    if reward_extra_infos_dict is not None:
+        for key in ("acc", "accuracy", "is_correct", "correct"):
+            if key in reward_extra_infos_dict:
+                correct_arr = np.asarray(reward_extra_infos_dict[key])
+                if correct_arr.shape[0] == reward_tensor.size(0):
+                    correct_mask = torch.as_tensor(correct_arr, device=reward_tensor.device).to(torch.float32) > 0.5
+                    break
+    if correct_mask is None:
+        # Fallback for reward functions without explicit correctness field.
+        correct_mask = reward_tensor.sum(dim=-1) > 0
+    pass_bonus = pass_bonus * correct_mask.to(pass_bonus.dtype)
+
+    if "response_mask" in reward_batch.batch:
+        response_mask = reward_batch.batch["response_mask"]
+    else:
+        response_len = reward_batch.batch["responses"].size(1)
+        response_mask = reward_batch.batch["attention_mask"][:, -response_len:]
+    last_token_idx = response_mask.sum(dim=-1).long() - 1
+    valid = last_token_idx >= 0
+    if valid.any():
+        rows = torch.arange(reward_tensor.size(0), device=reward_tensor.device)[valid]
+        reward_tensor[rows, last_token_idx[valid]] += pass_bonus[valid]
+
+    metrics = {
+        "reward/pass_bonus_coef": coef,
+        "reward/pass_used_mean": pass_used.to(torch.float32).mean().item(),
+        "reward/pass_bonus_mean": pass_bonus.mean().item(),
+        "reward/pass_bonus_nonzero_frac": (pass_bonus > 0).to(torch.float32).mean().item(),
+    }
+    return reward_tensor, metrics
 
 class RayPPOTrainer:
     # TODO: support each role have individual ray_worker_group_cls,
@@ -1214,6 +1272,13 @@ class RayPPOTrainer:
                             ##### make sure that samples in indexed proto are in same order as original_batch
                             reward_batch = final_batch(batch, final_mask, sample_index).union(original_batch)
                             reward_tensor, reward_extra_infos_dict = compute_reward(reward_batch, self.reward_fn)
+                            reward_tensor, pass_reward_metrics = apply_pass_reward_bonus(
+                                reward_tensor=reward_tensor,
+                                reward_batch=reward_batch,
+                                recurrent_config=self.recurrent_config,
+                                reward_extra_infos_dict=reward_extra_infos_dict,
+                            )
+                            metrics.update(pass_reward_metrics)
                     
                     # [MemAgent][TODO] 需要检查 dapo filter 逻辑，这里没有走 RayDAPOTrainer
                     # 这里可能有 bug，如果当前 batch 全部被删掉了，后续的流程可能会出问题（比如 log_prob 计算会报错）
@@ -1369,7 +1434,7 @@ class RayPPOTrainer:
                             batch.batch['token_level_scores'] = reward_tensor[sample_index]
 
                             if self.config.actor_rollout_ref.actor.get('use_kl_loss', False):
-                                loguru.logger.warning("KL penalty is not implemented for recurrent.")
+                                loguru.logger.warning("KL penalty is not implemented for recurrent?")
                             
                             batch.batch['token_level_rewards'] = batch.batch['token_level_scores']
 

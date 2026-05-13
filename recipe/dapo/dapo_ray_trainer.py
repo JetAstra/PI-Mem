@@ -37,6 +37,7 @@ from verl.trainer.ppo.metric_utils import (
 from verl.trainer.ppo.ray_trainer import (
     AdvantageEstimator,
     RayPPOTrainer,
+    apply_pass_reward_bonus,
     apply_kl_penalty,
     compute_1D_grpo_advantage,
     compute_advantage,
@@ -235,6 +236,15 @@ class RayDAPOTrainer(RayPPOTrainer):
                         except Exception as e:
                             print(f"Error in reward_fn: {e}")
                             local_reward_tensor = self.reward_fn(reward_input_batch)
+
+                        if self.config.recurrent.enable:
+                            local_reward_tensor, pass_reward_metrics = apply_pass_reward_bonus(
+                                reward_tensor=local_reward_tensor,
+                                reward_batch=reward_input_batch,
+                                recurrent_config=self.recurrent_config,
+                                reward_extra_infos_dict=reward_extra_infos_dict,
+                            )
+                            metrics.update(pass_reward_metrics)
 
                         reward_input_batch.batch["token_level_scores"] = local_reward_tensor
 

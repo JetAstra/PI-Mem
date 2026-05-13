@@ -1020,14 +1020,14 @@ trainer:
 recurrent:
   enable: False
   trival:
-    async_path: "/mnt/shared-storage-user/dllm-share/liudawei/verl/recurrent/impls/async_trival.py"
+    async_path: "recurrent/impls/async_trival.py"
     async_name: REGISTER
     config:
       ~
   memory:
-    path: "/mnt/shared-storage-user/dllm-share/liudawei/verl/recurrent/impls/memory.py"
+    path: "recurrent/impls/memory.py"
     name: REGISTER
-    async_path: "/mnt/shared-storage-user/dllm-share/liudawei/verl/recurrent/impls/async_memory.py"
+    async_path: "recurrent/impls/async_memory.py"
     async_name: REGISTER
     config:
       context_key: context
@@ -1038,8 +1038,9 @@ recurrent:
       max_final_response_length: 1024
       max_passes: 3
       max_merge_length: 1024
+      pass_reward_coef: 0.2
   tool_gsm8k:
-    async_path: "/mnt/shared-storage-user/dllm-share/liudawei/verl/recurrent/impls/async_tool_gsm8k.py"
+    async_path: "recurrent/impls/async_tool_gsm8k.py"
     async_name: REGISTER
     config:
       max_turn: 5

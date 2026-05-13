@@ -1,19 +1,19 @@
 import logging
+import math
 from dataclasses import dataclass
 from typing import List, Optional, Tuple, Union
 from uuid import uuid4
 
 import numpy as np
-import math
 import torch
-import verl.utils.torch_functional as verl_F
 from omegaconf import DictConfig
 from transformers import PreTrainedTokenizer, ProcessorMixin
 from typing_extensions import override
-from verl.protocol import DataProto
 
+import verl.utils.torch_functional as verl_F
 from recurrent.interface import RAgent, RConfig, RDataset, RRegister
 from recurrent.utils import TokenTemplate, chat_template, unpad
+from verl.protocol import DataProto
 
 logger = logging.getLogger(__file__)
 logger.setLevel("INFO")
@@ -29,6 +29,7 @@ class MemoryConfig(RConfig):
     max_final_response_length: int
     max_passes: int = 3  # number of full pass→merge iterations
     max_merge_length: int = 2048  # max output tokens for the merge step
+    pass_reward_coef: float = 0.0  # add-on reward: fewer passes -> higher bonus
     no_new_info_marker: str = (
         "<check>no</check>"  # marker the model outputs when chunk has no new info
     )
@@ -77,7 +78,7 @@ class MemoryDataset(RDataset):
         data_config: DictConfig,
         processor: Optional[ProcessorMixin] = None,
     ):
-        logger.info(f"[Check Recurrent Cfg]  {recurrent_config}\n")
+        logger.info(f"[Check Recurrent Cfg] {recurrent_config}\n")
         if data_config.truncation != 'middle':
             raise ValueError(f'MemoryDataset only support middle truncation, got {data_config.truncation=}')
         chunk_size = recurrent_config.chunk_size
@@ -289,6 +290,10 @@ class MemoryAgent(RAgent):
 
         # Per-sample convergence state
         self.converged = np.full(self.bsz, False, dtype=bool)
+        # Per-sample pass index used by reward shaping on final answers.
+        # Record the first pass when a sample converges; unresolved samples
+        # will be filled with the pass index when the batch enters final phase.
+        self.sample_pass_used = np.full(self.bsz, -1, dtype=np.int32)
 
     def _is_no_new_info(self, response_tokens: torch.Tensor) -> bool:
         """Check if the model's response contains <check>no</check>."""
@@ -303,10 +308,18 @@ class MemoryAgent(RAgent):
             has_new_info = any(cm[i] is not None for cm in self.chunk_memories)
             if not has_new_info:
                 self.converged[i] = True
+                if self.sample_pass_used[i] < 0:
+                    self.sample_pass_used[i] = self.pass_num + 1
                 logger.info(
                     f"[CONVERGENCE] Sample {i} converged at pass {self.pass_num} "
                     f"(all chunks returned {self.config.no_new_info_marker})"
                 )
+
+    def _finalize_sample_pass_used(self, final_pass: int):
+        final_pass = max(int(final_pass), 1)
+        unset_mask = self.sample_pass_used < 0
+        if np.any(unset_mask):
+            self.sample_pass_used[unset_mask] = final_pass
 
     @override
     def action(self) -> Tuple[List[torch.Tensor], dict]:
@@ -329,6 +342,7 @@ class MemoryAgent(RAgent):
             self._check_pass_convergence()
             if self.converged.all():
                 self.pass_num += 1
+                self._finalize_sample_pass_used(self.pass_num)
                 self.phase = "final"
                 logger.info(
                     f"[CONVERGENCE] All samples converged at pass {self.pass_num - 1}, skipping merge"
@@ -387,6 +401,19 @@ class MemoryAgent(RAgent):
                 continue
             # Concatenate non-None chunk memories for this sample with section labels
             parts = []
+            prev_memory = self.global_memory[i]
+            if prev_memory is not None:
+                parts.append(
+                    torch.tensor(
+                        self.tokenizer.encode(
+                            "\n[Previous Memory]:\n", add_special_tokens=False
+                        ),
+                        dtype=torch.long,
+                    )
+                )
+                if not isinstance(prev_memory, torch.Tensor):
+                    prev_memory = torch.tensor(prev_memory, dtype=torch.long)
+                parts.append(prev_memory)
             section_idx = 0
             for chunk_mem_array in self.chunk_memories:
                 if chunk_mem_array[i] is not None:
@@ -455,6 +482,16 @@ class MemoryAgent(RAgent):
 
     @override
     def update(self, gen_output: DataProto) -> DataProto:
+        # Track pass count per generated turn so trainer can shape reward on final answers.
+        if self.phase == "final":
+            self._finalize_sample_pass_used(self.pass_num)
+            gen_output.non_tensor_batch["pass_used"] = self.sample_pass_used.copy()
+        else:
+            current_pass = self.pass_num + 1
+            gen_output.non_tensor_batch["pass_used"] = np.full(
+                (len(gen_output),), current_pass, dtype=np.int32
+            )
+
         if self.phase == "chunk":
             # Save per-chunk memory, detect [NO_NEW_INFO]
             chunk_mem = np.empty(self.bsz, dtype=object)
@@ -479,6 +516,7 @@ class MemoryAgent(RAgent):
                 self._check_pass_convergence()
                 if self.converged.all():
                     self.pass_num += 1
+                    self._finalize_sample_pass_used(self.pass_num)
                     self.phase = "final"
                 else:
                     self.phase = "merge"
@@ -491,6 +529,7 @@ class MemoryAgent(RAgent):
             self.global_memory[self.merge_mask] = new_memories
             self.pass_num += 1
             if self.pass_num >= self.config.max_passes or self.converged.all():
+                self._finalize_sample_pass_used(self.pass_num)
                 self.phase = "final"
             else:
                 # Reset for next pass
@@ -518,6 +557,7 @@ class MemoryAgent(RAgent):
         del self.chunk_memories
         del self.messages
         del self.converged
+        del self.sample_pass_used
         sample_index = torch.cat(self.sample_index_list)
         final_mask = torch.cat(self.final_mask_list)
         del self.final_mask_list

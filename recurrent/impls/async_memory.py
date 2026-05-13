@@ -48,7 +48,7 @@ class AsyncMemoryDataset(RDataset):
             recurrent_config.max_chunks * recurrent_config.chunk_size
         )
         self.context_key = recurrent_config.context_key
-        logger.info(f"[Check Recurrent Cfg]  {recurrent_config}\n")
+        logger.info(f"[Check Recurrent Cfg] {recurrent_config}\n")
         super().__init__(
             recurrent_config=recurrent_config,
             data_files=data_files,
