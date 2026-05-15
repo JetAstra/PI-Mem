@@ -12,7 +12,7 @@ from typing_extensions import override
 
 import verl.utils.torch_functional as verl_F
 from recurrent.interface import RAgent, RConfig, RDataset, RRegister
-from recurrent.utils import TokenTemplate, chat_template, unpad
+from recurrent.utils import chat_template, unpad
 from verl.protocol import DataProto
 
 logger = logging.getLogger(__file__)
@@ -133,7 +133,8 @@ class MemoryDataset(RDataset):
         row_dict: dict = self.dataframe[item]
 
         chat = row_dict.pop(self.prompt_key)
-        context = row_dict.pop(self.context_key)
+        context = row_dict.pop(self.context_key).strip()
+        prompt = chat[0]["content"].strip()
 
         model_inputs = self.tokenizer(
             context, return_tensors="pt", add_special_tokens=False
@@ -154,9 +155,7 @@ class MemoryDataset(RDataset):
         row_dict["context_ids"] = context_ids[0]
         lengths = attention_mask.sum(dim=-1)
         row_dict["context_length"] = lengths[0]
-        row_dict["prompt_ids"] = self.tokenizer.encode(
-            chat[0]["content"], add_special_tokens=False
-        )
+        row_dict["prompt"] = prompt
         index = row_dict.get("extra_info", {}).get("index", 0)
         row_dict["index"] = index
         row_dict["sample_uuid"] = str(uuid4())
@@ -166,8 +165,8 @@ class MemoryDataset(RDataset):
     @override
     def get_bactch_keys(self) -> Tuple[List[str], List[str]]:
         # tensor can use 2-deminsional index for chunking.
-        # while prompt_ids will not be indexed, so keep it as list.
-        return ["context_ids", "context_length"], ["prompt_ids"]
+        # while prompt will not be indexed, so keep it as list.
+        return ["context_ids", "context_length"], ["prompt"]
 
 
 TEMPLATE_CHUNK = """You are presented with a problem, a section of an article, and a global memory summarizing previously gathered information. Please read the section carefully and determine whether the section contains new information relevant to answering the problem beyond what is already in the global memory. First, output your judgment in the format <check>yes</check> if there is new information, or <check>no</check> if there is none. Then, if there is new information, extract and list the key details.
@@ -213,6 +212,31 @@ TEMPLATE_FINAL_BOXED = """You are presented with a problem and a previous memory
 Your answer:
 """
 
+NO_MEMORY = "No previous memory"
+NO_NEW_INFO_MARKER = "<check>no</check>"
+PREVIOUS_MEMORY_LABEL = "[Previous Memory]:"
+SECTION_LABEL_TEMPLATE = "[Section {idx}]:"
+
+
+def build_merge_memories(previous_memory: str | None, new_memories: list[str]) -> str:
+    """
+    Build the <extracted_information> payload to match parallel_boxed.py exactly.
+    """
+    parts = []
+
+    if previous_memory and previous_memory.strip() and previous_memory.strip() != NO_MEMORY:
+        parts.append(f"{PREVIOUS_MEMORY_LABEL}\n{previous_memory.strip()}")
+
+    for i, mem in enumerate(new_memories, start=1):
+        if mem is None:
+            continue
+        mem = mem.strip()
+        if not mem:
+            continue
+        parts.append(f"{SECTION_LABEL_TEMPLATE.format(idx=i)}\n{mem}")
+
+    return "\n\n".join(parts) if parts else NO_MEMORY
+
 
 class MemoryAgent(RAgent):
     def __init__(self, tokenizer: PreTrainedTokenizer, config: MemoryConfig):
@@ -220,40 +244,43 @@ class MemoryAgent(RAgent):
         self.tokenizer = tokenizer
         self.chat_template = chat_template(tokenizer)
 
-        # Three TokenTemplates for three phases
-        self.token_chunk_template = TokenTemplate(
-            self.chat_template.format(message=TEMPLATE_CHUNK), tokenizer
-        )
-        self.token_merge_template = TokenTemplate(
-            self.chat_template.format(message=TEMPLATE_MERGE), tokenizer
-        )
-        self.token_final_template = TokenTemplate(
-            self.chat_template.format(message=TEMPLATE_FINAL_BOXED), tokenizer
-        )
-
-        # Pre-tokenize section labels for merge step: "\n[Section 1]:\n", "\n[Section 2]:\n", ...
-        self.SECTION_LABELS = [
-            torch.tensor(
-                tokenizer.encode(f"\n[Section {i + 1}]:\n", add_special_tokens=False),
-                dtype=torch.long,
+        chunk_template_len = self._encode_user_message(
+            TEMPLATE_CHUNK.format(prompt="", memory="", chunk="")
+        ).numel()
+        merge_template_len = self._encode_user_message(
+            TEMPLATE_MERGE.format(prompt="", memories="")
+        ).numel()
+        final_template_len = self._encode_user_message(
+            TEMPLATE_FINAL_BOXED.format(prompt="", memory="")
+        ).numel()
+        max_label_len = max(
+            len(
+                tokenizer.encode(
+                    f"\n\n{SECTION_LABEL_TEMPLATE.format(idx=i + 1)}\n",
+                    add_special_tokens=False,
+                )
             )
             for i in range(config.max_chunks)
-        ]
-        max_label_len = max(len(l) for l in self.SECTION_LABELS)
+        )
+        previous_label_len = len(
+            tokenizer.encode(
+                f"{PREVIOUS_MEMORY_LABEL}\n",
+                add_special_tokens=False,
+            )
+        )
 
         # Compute max input lengths per phase
-        self.max_chunk_input_length = (
-            config.max_raw_input_length + self.token_chunk_template.length
-        )
+        self.max_chunk_input_length = config.max_raw_input_length + chunk_template_len
         self.max_merge_input_length = (
             config.max_raw_merge_input_length
             + config.max_chunks * max_label_len
-            + self.token_merge_template.length
+            + previous_label_len
+            + merge_template_len
         )
         self.max_final_input_length = (
             config.max_prompt_length
             + config.max_merge_length
-            + self.token_final_template.length
+            + final_template_len
         )
         self.max_input_length = max(
             self.max_chunk_input_length,
@@ -266,9 +293,21 @@ class MemoryAgent(RAgent):
             f"final={self.max_final_input_length})\n"
         )
 
-        self.NO_MEMORY_TOKENS = tokenizer.encode(
-            "No previous memory", add_special_tokens=False
+    def _encode_user_message(self, content: str) -> torch.LongTensor:
+        return torch.tensor(
+            self.tokenizer.encode(
+                self.chat_template.format(message=content),
+                add_special_tokens=False,
+            ),
+            dtype=torch.long,
         )
+
+    def _decode_text(self, value) -> str:
+        if value is None:
+            return NO_MEMORY
+        if isinstance(value, torch.Tensor):
+            return self.tokenizer.decode(value, skip_special_tokens=True).strip()
+        return str(value).strip()
 
     @override
     def start(self, gen_batch: DataProto, timing_raw: dict):
@@ -284,7 +323,7 @@ class MemoryAgent(RAgent):
         self.phase = "chunk"  # "chunk" | "merge" | "final"
         self.pass_num = 0
         self.chunk_step = 0
-        self.global_memory = np.empty(self.bsz, dtype=object)  # None per sample
+        self.global_memory = np.full(self.bsz, None, dtype=object)
         self.chunk_memories = []  # list of np.ndarray(object), one per chunk step
         self.is_done = False
 
@@ -298,7 +337,7 @@ class MemoryAgent(RAgent):
     def _is_no_new_info(self, response_tokens: torch.Tensor) -> bool:
         """Check if the model's response contains <check>no</check>."""
         text = self.tokenizer.decode(response_tokens, skip_special_tokens=True)
-        return self.config.no_new_info_marker in text
+        return self.config.no_new_info_marker.lower() in text.lower()
 
     def _check_pass_convergence(self):
         """After all chunks in a pass, mark samples as converged if all their chunks were [NO_NEW_INFO]."""
@@ -353,7 +392,7 @@ class MemoryAgent(RAgent):
                 return self._merge_action()
 
         gen_batch = self.gen_batch
-        prompt_i = gen_batch.non_tensor_batch["prompt_ids"][active_mask]
+        prompt_i = gen_batch.non_tensor_batch["prompt"][active_mask]
         chunk_i = gen_batch.batch["context_ids"][
             active_mask,
             self.config.chunk_size
@@ -363,10 +402,14 @@ class MemoryAgent(RAgent):
         memory_i = self.global_memory[active_mask]
 
         self.messages = [
-            self.token_chunk_template.format(
-                prompt=prompt,
-                memory=(memory if memory is not None else self.NO_MEMORY_TOKENS),
-                chunk=chunk[chunk != self.tokenizer.pad_token_id],
+            self._encode_user_message(
+                TEMPLATE_CHUNK.format(
+                    prompt=prompt,
+                    memory=self._decode_text(memory),
+                    chunk=self.tokenizer.decode(
+                        chunk[chunk != self.tokenizer.pad_token_id]
+                    ),
+                )
             )
             for prompt, memory, chunk in zip(prompt_i, memory_i, chunk_i)
         ]
@@ -399,38 +442,24 @@ class MemoryAgent(RAgent):
         for i in range(self.bsz):
             if self.converged[i]:
                 continue
-            # Concatenate non-None chunk memories for this sample with section labels
-            parts = []
-            prev_memory = self.global_memory[i]
-            if prev_memory is not None:
-                parts.append(
-                    torch.tensor(
-                        self.tokenizer.encode(
-                            "\n[Previous Memory]:\n", add_special_tokens=False
-                        ),
-                        dtype=torch.long,
-                    )
-                )
-                if not isinstance(prev_memory, torch.Tensor):
-                    prev_memory = torch.tensor(prev_memory, dtype=torch.long)
-                parts.append(prev_memory)
-            section_idx = 0
-            for chunk_mem_array in self.chunk_memories:
-                if chunk_mem_array[i] is not None:
-                    parts.append(self.SECTION_LABELS[section_idx])
-                    mem = chunk_mem_array[i]
-                    if not isinstance(mem, torch.Tensor):
-                        mem = torch.tensor(mem, dtype=torch.long)
-                    parts.append(mem)
-                    section_idx += 1
-            memories = (
-                torch.cat(parts)
-                if parts
-                else torch.tensor(self.NO_MEMORY_TOKENS, dtype=torch.long)
+            new_memories = [
+                self._decode_text(chunk_mem_array[i])
+                for chunk_mem_array in self.chunk_memories
+                if chunk_mem_array[i] is not None
+            ]
+            memories = build_merge_memories(
+                previous_memory=(
+                    self._decode_text(self.global_memory[i])
+                    if self.global_memory[i] is not None
+                    else None
+                ),
+                new_memories=new_memories,
             )
-            msg = self.token_merge_template.format(
-                prompt=gen_batch.non_tensor_batch["prompt_ids"][i],
-                memories=memories,
+            msg = self._encode_user_message(
+                TEMPLATE_MERGE.format(
+                    prompt=gen_batch.non_tensor_batch["prompt"][i],
+                    memories=memories,
+                )
             )
             self.messages.append(msg)
 
@@ -455,12 +484,14 @@ class MemoryAgent(RAgent):
     def _final_action(self) -> Tuple[List[torch.Tensor], dict]:
         gen_batch = self.gen_batch
         self.messages = [
-            self.token_final_template.format(
-                prompt=prompt,
-                memory=(memory if memory is not None else self.NO_MEMORY_TOKENS),
+            self._encode_user_message(
+                TEMPLATE_FINAL_BOXED.format(
+                    prompt=prompt,
+                    memory=self._decode_text(memory),
+                )
             )
             for prompt, memory in zip(
-                gen_batch.non_tensor_batch["prompt_ids"], self.global_memory
+                gen_batch.non_tensor_batch["prompt"], self.global_memory
             )
         ]
         sample_index = torch.arange(self.bsz, dtype=torch.long)
@@ -485,16 +516,18 @@ class MemoryAgent(RAgent):
         # Track pass count per generated turn so trainer can shape reward on final answers.
         if self.phase == "final":
             self._finalize_sample_pass_used(self.pass_num)
-            gen_output.non_tensor_batch["pass_used"] = self.sample_pass_used.copy()
+            gen_output.batch["pass_used"] = torch.as_tensor(
+                self.sample_pass_used, dtype=torch.long
+            )
         else:
             current_pass = self.pass_num + 1
-            gen_output.non_tensor_batch["pass_used"] = np.full(
-                (len(gen_output),), current_pass, dtype=np.int32
+            gen_output.batch["pass_used"] = torch.full(
+                (len(gen_output),), current_pass, dtype=torch.long
             )
 
         if self.phase == "chunk":
             # Save per-chunk memory, detect [NO_NEW_INFO]
-            chunk_mem = np.empty(self.bsz, dtype=object)
+            chunk_mem = np.full(self.bsz, None, dtype=object)
             responses = unpad(
                 self.tokenizer, gen_output.batch["responses"], remove_eos=True
             )

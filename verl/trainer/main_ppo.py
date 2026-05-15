@@ -18,6 +18,7 @@ Note that we don't combine the main with ray_trainer as ray_trainer is used by o
 import os
 import socket
 
+import loguru
 import hydra
 import ray
 from omegaconf import OmegaConf
@@ -233,6 +234,14 @@ class TaskRunner:
 
         from verl.utils.fs import copy_to_local
 
+        if os.environ.get("ENABLE_RAY_DEBUGPY", "0") == "1":
+            import debugpy
+            host = os.environ.get("DEBUGPY_HOST", "127.0.0.1")
+            port = int(os.environ.get("DEBUGPY_PORT", "5666"))
+            debugpy.listen((host, port))
+            loguru.logger.debug(f"TaskRunner waiting for VSCode attach at {host}:{port}")
+            debugpy.wait_for_client()
+
         print(f"TaskRunner hostname: {socket.gethostname()}, PID: {os.getpid()}")
         pprint(OmegaConf.to_container(config, resolve=True))
         OmegaConf.resolve(config)
@@ -273,23 +282,27 @@ class TaskRunner:
         from verl.utils.dataset.rl_dataset import collate_fn
 
         # Create training and validation datasets.
-        train_dataset = create_rl_dataset(
-            config.data.train_files,
-            config.data,
-            tokenizer,
-            processor,
-            is_train=True,
-            max_samples=config.data.get("train_max_samples", -1),
-        )
-        val_dataset = create_rl_dataset(
-            config.data.val_files,
-            config.data,
-            tokenizer,
-            processor,
-            is_train=False,
-            max_samples=config.data.get("val_max_samples", -1),
-        )
-        train_sampler = create_rl_sampler(config.data, train_dataset)
+        # [MemAgent] Create ds inside RayPPOTrainer
+        if not config.recurrent.enable:
+            train_dataset = create_rl_dataset(
+                config.data.train_files,
+                config.data,
+                tokenizer,
+                processor,
+                is_train=True,
+                max_samples=config.data.get("train_max_samples", -1),
+            )
+            val_dataset = create_rl_dataset(
+                config.data.val_files,
+                config.data,
+                tokenizer,
+                processor,
+                is_train=False,
+                max_samples=config.data.get("val_max_samples", -1),
+            )
+            train_sampler = create_rl_sampler(config.data, train_dataset)
+        else:
+            train_dataset = val_dataset = train_sampler = None
 
         # Initialize the PPO trainer.
         trainer = RayPPOTrainer(

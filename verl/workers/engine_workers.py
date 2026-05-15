@@ -13,7 +13,8 @@
 # limitations under the License.
 import functools
 import logging
-import os
+import os, errno, atexit, signal
+import threading
 from contextlib import nullcontext
 from copy import deepcopy
 from functools import partial
@@ -26,6 +27,7 @@ from codetiming import Timer
 from omegaconf import DictConfig, open_dict
 from tensordict import NonTensorData, TensorDict
 from torch.distributed.device_mesh import init_device_mesh
+import torch.distributed as dist
 
 from verl.checkpoint_engine import CheckpointEngineRegistry
 from verl.single_controller.base import Worker
@@ -56,6 +58,103 @@ from verl.workers.utils.losses import ppo_loss
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
+
+_DEBUGPY_STARTED = False
+_DEBUGPY_LOCK_FD = None
+
+def _pid_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        # 单机一般不会出现；保守起见当活着
+        return True
+
+def _release_lock():
+    global _DEBUGPY_LOCK_FD, _DEBUGPY_LOCK_PATH
+    try:
+        if _DEBUGPY_LOCK_FD is not None:
+            os.close(_DEBUGPY_LOCK_FD)
+    finally:
+        _DEBUGPY_LOCK_FD = None
+        if _DEBUGPY_LOCK_PATH:
+            try:
+                os.unlink(_DEBUGPY_LOCK_PATH)
+            except FileNotFoundError:
+                pass
+            _DEBUGPY_LOCK_PATH = None
+
+def _install_cleanup(lock_path: str):
+    global _DEBUGPY_LOCK_PATH
+    _DEBUGPY_LOCK_PATH = lock_path
+    atexit.register(_release_lock)
+    # signal handlers can only be registered from the main thread
+    if threading.current_thread() is not threading.main_thread():
+        return
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        signal.signal(sig, lambda *_: (_release_lock(), exit(0)))
+
+def _try_global_lock(lock_path="/tmp/debugpy_5679.lock"):
+    """单机：有陈旧锁就自动清理"""
+    global _DEBUGPY_LOCK_FD
+
+    while True:
+        try:
+            _DEBUGPY_LOCK_FD = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_RDWR)
+            os.write(_DEBUGPY_LOCK_FD, str(os.getpid()).encode())
+            _install_cleanup(lock_path)
+            return True
+
+        except OSError as e:
+            if e.errno != errno.EEXIST:
+                raise
+
+            # 锁已存在：读 pid 判断是否陈旧
+            try:
+                with open(lock_path, "r") as f:
+                    old_pid = int(f.read().strip())
+            except Exception:
+                old_pid = -1
+
+            if old_pid > 0 and _pid_alive(old_pid):
+                # 真的有人在占用（比如你另一个调试进程还在）
+                return False
+
+            # 陈旧锁：删掉重抢
+            try:
+                os.unlink(lock_path)
+            except FileNotFoundError:
+                pass
+
+def ray_debug_break(tag: str, port: int = 5679):
+    global _DEBUGPY_STARTED
+    if os.environ.get("ENABLE_RAY_DEBUGPY", "0") != "1":
+        return
+    if not (dist.is_available() and dist.is_initialized()):
+        logger.warning(f"[debug break] {tag} - dist is not initialized!")
+        return
+
+    import debugpy
+    host = os.environ.get("DEBUGPY_HOST", "127.0.0.1")
+
+    # 所有 rank 先对齐，避免有人先跑进 collective
+    dist.barrier()
+
+    if dist.get_rank() == 0:
+        # 只有拿到“全机锁”的那个 rank0 才 listen
+        i_am_owner = _try_global_lock(f"/tmp/debugpy_{port}.lock")
+        if i_am_owner and not _DEBUGPY_STARTED:
+            debugpy.listen((host, port))
+            _DEBUGPY_STARTED = True
+            print(f"[debugpy] listening at {host}:{port}, pid={os.getpid()}, tag={tag}")
+        # 只有 owner 才 wait_for_client（否则会卡死在等 attach）
+        if i_am_owner and not debugpy.is_client_connected():
+            print(f"[debugpy] waiting attach at {tag} ...")
+            debugpy.wait_for_client()
+    # attach 完再放行
+    dist.barrier()
 
 
 def _with_routing_replay_flag(enabled: bool):
@@ -250,13 +349,27 @@ class TrainingWorker(Worker, DistProfilerExtension):
         disable_auto_offload = tu.pop(data, key="disable_auto_offload", default=False)
         mini_batch_size = tu.pop(data, key="mini_batch_size", default=None)
         num_mini_batch = tu.pop(data, key="num_mini_batch", default=None)
-        epochs = tu.pop(data, key="epochs", default=1)
+        epochs = tu.pop(data, key="epochs", default=1)  # ppo epochs
         seed = tu.pop(data, key="seed", default=42)
         dataloader_kwargs = tu.pop(data, key="dataloader_kwargs", default={})
+        recurrent_actor_update = tu.pop(data, key="recurrent_actor_update", default=False)
+        recurrent_actor_ppo_mini_batch_size = tu.pop(data, key="recurrent_actor_ppo_mini_batch_size", default=None)
+        recurrent_actor_train_batch_size = tu.pop(data, key="recurrent_actor_train_batch_size", default=None)
 
         assert mini_batch_size is not None or num_mini_batch is not None
 
-        if mini_batch_size is None:
+        if recurrent_actor_update:
+            # [MemAgent] Old dp_actor.py uses td_split(batch, train_batch_size // ppo_mini_batch_size)
+            # [MemAgent] on the padded batch, so dummy samples stay aligned across DP ranks until update ends.
+            assert mini_batch_size is None, "recurrent actor update expects num_mini_batch instead of mini_batch_size"
+            assert num_mini_batch is not None, "recurrent actor update expects num_mini_batch"
+            assert "no_padding_mask" in data, "recurrent actor update expects no_padding_mask"
+            assert recurrent_actor_ppo_mini_batch_size is not None
+            assert recurrent_actor_train_batch_size is not None
+            assert recurrent_actor_train_batch_size // recurrent_actor_ppo_mini_batch_size == num_mini_batch
+            assert batch_size_per_dp >= num_mini_batch, f"Got {batch_size_per_dp=} and {num_mini_batch=}"
+            mini_batch_size_per_gpu = None
+        elif mini_batch_size is None:
             assert batch_size_per_dp % num_mini_batch == 0, f"Got {batch_size_per_dp=} and {num_mini_batch=}"
             mini_batch_size_per_gpu = batch_size_per_dp // num_mini_batch
         else:
@@ -265,14 +378,21 @@ class TrainingWorker(Worker, DistProfilerExtension):
             )
             mini_batch_size_per_gpu = mini_batch_size // self.engine.get_data_parallel_size()
 
-        # make iterator
-        dataloader = tu.make_iterator(
-            data,
-            mini_batch_size=mini_batch_size_per_gpu,
-            epochs=epochs,
-            seed=seed + self.engine.get_data_parallel_rank(),
-            dataloader_kwargs=dataloader_kwargs,
-        )
+        if recurrent_actor_update:
+            # [MemAgent] Keep the same ordered torch.tensor_split/td_split semantics as the old recurrent workflow.
+            dataloader = [
+                tu.index_select_tensor_dict(data, indices)
+                for indices in torch.tensor_split(torch.arange(batch_size_per_dp), num_mini_batch)
+            ]
+        else:
+            # make iterator
+            dataloader = tu.make_iterator(
+                data,
+                mini_batch_size=mini_batch_size_per_gpu,
+                epochs=epochs,
+                seed=seed + self.engine.get_data_parallel_rank(),
+                dataloader_kwargs=dataloader_kwargs,
+            )
 
         with (
             self.engine.train_mode(disable_auto_offload=disable_auto_offload),
@@ -280,9 +400,18 @@ class TrainingWorker(Worker, DistProfilerExtension):
         ):
             # update
             output_lst = []
-            total_num_iterations = data.shape[0] // mini_batch_size_per_gpu * epochs
+            if recurrent_actor_update:
+                # [MemAgent] The recurrent iterator is rebuilt once like old dp_actor.py and replayed for ppo_epochs.
+                total_num_iterations = len(dataloader) * epochs
+            else:
+                total_num_iterations = data.shape[0] // mini_batch_size_per_gpu * epochs
 
-            for batch_idx, mini_batch_td in enumerate(dataloader):
+            if recurrent_actor_update:
+                batch_iterator = (mini_batch_td for _ in range(epochs) for mini_batch_td in dataloader)
+            else:
+                batch_iterator = dataloader
+
+            for batch_idx, mini_batch_td in enumerate(batch_iterator):
                 # add global token num
                 if "input_ids" in mini_batch_td:
                     global_token_num = mini_batch_td["input_ids"].offsets().diff().tolist()  # (total_nnz,)
@@ -296,6 +425,16 @@ class TrainingWorker(Worker, DistProfilerExtension):
                     global_token_num = [x for xs in global_token_num_output for x in xs]
                 else:
                     global_token_num = None
+
+                if recurrent_actor_update:
+                    # [MemAgent] For seq loss, use real trajectories in this mini-batch and exclude dummy padding rows.
+                    recurrent_global_batch_size = mini_batch_td["no_padding_mask"].to(self.device_name).sum()
+                    torch.distributed.all_reduce(
+                        recurrent_global_batch_size,
+                        op=torch.distributed.ReduceOp.SUM,
+                        group=self.engine.get_data_parallel_group(),
+                    )
+                    tu.assign_non_tensor(mini_batch_td, global_batch_size=int(recurrent_global_batch_size.item()))
 
                 tu.assign_non_tensor(
                     mini_batch_td,
@@ -447,6 +586,8 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         self, config: DictConfig, role: str, distillation_config: Optional[DistillationConfig] = None, **kwargs
     ):
         Worker.__init__(self)
+
+        ray_debug_break("init:entry", port=5667)
         self.config = config
         self.distillation_config = distillation_config
         self.distillation_enabled = is_distillation_enabled(distillation_config)
@@ -535,6 +676,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             self.ref.reset()
             self.set_dispatch_collect(mesh_name="ref", **self.ref.get_dispatch_collect())
 
+        ray_debug_break("init_model:actor", port=5667)
         # 2. build actor model
         if "actor" in self.role:
             actor_config: ActorConfig = omega_conf_to_dataclass(self.config.actor)
@@ -632,6 +774,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
     @DistProfiler.annotate(color="olive", role="ref_compute_log_prob")
     @_with_routing_replay_flag(enabled=False)
     def compute_ref_log_prob(self, data: TensorDict) -> TensorDict:
+        ray_debug_break("compute_ref_log_prob:entry", port=5667)
         output = self.ref.infer_batch(data=data)
         return output.cpu() if output is not None else None
 
@@ -647,6 +790,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
     @DistProfiler.annotate(color="red", role="actor_update")
     @_with_routing_replay_flag(enabled=True)
     def update_actor(self, data: TensorDict) -> TensorDict:
+        # ray_debug_break("update_actor:entry", port=5667)
         output = self.actor.train_mini_batch(data=data)
         return output.cpu() if output is not None else None
 

@@ -95,11 +95,19 @@ class AsyncOutput(ABC):
         final_mask: bool,
         timing_raw: dict,
         metrics: dict = None,
+        non_tensor_batch: dict = None,
+        batch: dict = None,
     ):
         self.conversations = conversations
         self.sample_index = sample_index
         self.final_mask = final_mask
         self.timing_raw = timing_raw
+        if non_tensor_batch is None:
+            non_tensor_batch = {}
+        self.non_tensor_batch = non_tensor_batch
+        if batch is None:
+            batch = {}
+        self.batch = batch
         if metrics is None:
             metrics = {}
         self.metrics = metrics
