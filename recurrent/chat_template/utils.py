@@ -14,7 +14,11 @@ def set_chat_template(tokenizer):
     """
     name = type(tokenizer).__name__
     if name not in __registered_tokenizer__:
-        raise ValueError(f"tokenizer {name} not registered")
+        if getattr(tokenizer, "chat_template", None):
+            return tokenizer
+        raise ValueError(
+            f"tokenizer {name} not registered and does not provide a chat_template"
+        )
     with open(__template_dir / f"{name}.j2" , 'r') as f:
         tokenizer.chat_template = f.read()
     return tokenizer

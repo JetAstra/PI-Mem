@@ -27,6 +27,8 @@ from recurrent.impls.memory import (
     TEMPLATE_CHUNK,
     TEMPLATE_MERGE,
     TEMPLATE_FINAL_BOXED,
+    NO_MEMORY,
+    build_merge_memories,
 )
 
 
@@ -44,7 +46,7 @@ class AsyncMemoryDataset(RDataset):
         processor: Optional[ProcessorMixin] = None,
     ):
         if data_config.truncation != "middle":
-            raise ValueError("MemoryDataset only support center truncation")
+            raise ValueError("AsyncMemoryDataset only support center truncation")
         chunk_size = recurrent_config.chunk_size
         old_max_chunks = recurrent_config.max_chunks
         old_max_prompt_length = data_config.max_prompt_length
@@ -55,7 +57,7 @@ class AsyncMemoryDataset(RDataset):
             recurrent_config.max_chunks = new_max_chunks
             data_config.max_prompt_length = new_max_chunks * chunk_size
             logger.info(
-                "[MemoryDataset] recompute by max_prompt_length/chunk_size: "
+                "[AsyncMemoryDataset] recompute by max_prompt_length/chunk_size: "
                 f"max_chunks {old_max_chunks} -> {new_max_chunks}, "
                 f"max_prompt_length {old_max_prompt_length} -> {data_config.max_prompt_length} "
                 f"(chunk_size={recurrent_config.chunk_size})"
@@ -64,7 +66,7 @@ class AsyncMemoryDataset(RDataset):
             recurrent_config.max_chunks = math.ceil(old_max_prompt_length / chunk_size)
             data_config.max_prompt_length = recurrent_config.max_chunks * chunk_size
             logger.info(
-                "[MemoryDataset] infer max_chunks from max_prompt_length: "
+                "[AsyncMemoryDataset] infer max_chunks from max_prompt_length: "
                 f"max_chunks None -> {recurrent_config.max_chunks}, "
                 f"max_prompt_length {old_max_prompt_length} -> {data_config.max_prompt_length} "
                 f"(chunk_size={recurrent_config.chunk_size})"
@@ -72,7 +74,7 @@ class AsyncMemoryDataset(RDataset):
         elif old_max_chunks is not None:
             data_config.max_prompt_length = old_max_chunks * chunk_size
             logger.info(
-                "[MemoryDataset] infer max_prompt_length from max_chunks: "
+                "[AsyncMemoryDataset] infer max_prompt_length from max_chunks: "
                 f"max_chunks {recurrent_config.max_chunks}, "
                 f"max_prompt_length {data_config.max_prompt_length} "
                 f"(chunk_size={recurrent_config.chunk_size})"
@@ -98,7 +100,8 @@ class AsyncMemoryDataset(RDataset):
         row_dict: dict = self.dataframe[item]
 
         chat = row_dict.pop(self.prompt_key)
-        context = row_dict.pop(self.context_key)
+        context = row_dict.pop(self.context_key).strip()
+        prompt = chat[0]["content"].strip()
 
         model_inputs = self.tokenizer(
             context, return_tensors="pt", add_special_tokens=False
@@ -119,7 +122,7 @@ class AsyncMemoryDataset(RDataset):
         row_dict["context_ids"] = context_ids[0]
         lengths = attention_mask.sum(dim=-1)
         row_dict["context_length"] = lengths[0]
-        row_dict["prompt"] = chat[0]["content"]
+        row_dict["prompt"] = prompt
         index = row_dict.get("extra_info", {}).get("index", 0)
         row_dict["index"] = index
         row_dict["sample_uuid"] = str(uuid4())
@@ -156,11 +159,14 @@ class AsyncMemoryAgent(AsyncRAgent):
         sample_index = gen_item.batch["sample_index"].item()
         context_length = gen_item.batch["context_length"].item()
         conversations = []
-        global_memory = None
+        global_memory = NO_MEMORY
+        final_pass_used = 1
         self.config: MemoryConfig
         chunk_size = self.config.chunk_size
 
         for pass_num in range(self.config.max_passes):
+            current_pass = pass_num + 1
+            final_pass_used = current_pass
             chunk_memories = []
             all_no_new_info = True
             step = 0
@@ -174,6 +180,7 @@ class AsyncMemoryAgent(AsyncRAgent):
                     chunk_ids = gen_item.batch["context_ids"][
                         step * chunk_size : (step + 1) * chunk_size
                     ]
+                    chunk_ids = chunk_ids[chunk_ids != self.tokenizer.pad_token_id]
 
                     kwargs = self.sampling_params(gen_item.meta_info)
                     if sample_index == 0:
@@ -187,14 +194,8 @@ class AsyncMemoryAgent(AsyncRAgent):
                             "role": "user",
                             "content": TEMPLATE_CHUNK.format(
                                 prompt=gen_item.non_tensor_batch["prompt"],
-                                memory=(
-                                    global_memory
-                                    if global_memory
-                                    else "No previous memory"
-                                ),
-                                chunk=self.tokenizer.decode(
-                                    chunk_ids, skip_special_tokens=True
-                                ),
+                                memory=global_memory,
+                                chunk=self.tokenizer.decode(chunk_ids),
                             ),
                         }
                     ]
@@ -210,7 +211,7 @@ class AsyncMemoryAgent(AsyncRAgent):
                     conversations.append(conversation)
                     content = conversation[-1]["content"]
                     # Detect [NO_NEW_INFO] marker
-                    if self.config.no_new_info_marker in content:
+                    if self.config.no_new_info_marker.lower() in content.lower():
                         chunk_memories.append(None)
                     else:
                         chunk_memories.append(content)
@@ -223,18 +224,16 @@ class AsyncMemoryAgent(AsyncRAgent):
             if all_no_new_info:
                 if sample_index == 0:
                     logger.info(
-                        f"[CONVERGENCE] Sample converged at pass {pass_num} "
+                        f"[Recurrent][CONVERGENCE] Sample converged at pass {pass_num} "
                         f"(all chunks returned {self.config.no_new_info_marker})"
                     )
                 break
 
             # Merge step: consolidate only non-None chunk memories
             with _timer("mt_mics", timing_raw):
-                valid_memories = [
-                    (i, m) for i, m in enumerate(chunk_memories) if m is not None
-                ]
-                memories_text = "\n".join(
-                    f"[Section {i + 1}]:\n{m}" for i, m in valid_memories
+                memories_text = build_merge_memories(
+                    previous_memory=global_memory,
+                    new_memories=[m for m in chunk_memories if m is not None],
                 )
                 kwargs = self.sampling_params(gen_item.meta_info)
                 kwargs["max_completion_tokens"] = self.config.max_merge_length
@@ -258,7 +257,7 @@ class AsyncMemoryAgent(AsyncRAgent):
                 choice = completions.choices[0]
                 merge_conversation.append(msg(choice))
                 conversations.append(merge_conversation)
-                global_memory = merge_conversation[-1]["content"]
+                global_memory = merge_conversation[-1]["content"].strip()
                 if sample_index == 0:
                     log_step(logger, f"pass{pass_num}_merge", merge_conversation)
 
@@ -269,7 +268,7 @@ class AsyncMemoryAgent(AsyncRAgent):
                     "role": "user",
                     "content": TEMPLATE_FINAL_BOXED.format(
                         prompt=gen_item.non_tensor_batch["prompt"],
-                        memory=global_memory if global_memory else "No previous memory",
+                        memory=global_memory,
                     ),
                 }
             ]
@@ -293,7 +292,16 @@ class AsyncMemoryAgent(AsyncRAgent):
             )
             final_mask = torch.full((len(conversations),), False, dtype=torch.bool)
             final_mask[-1] = True
-        return AsyncOutput(conversations, sample_index, final_mask, timing_raw)
+            pass_used = torch.full(
+                (len(conversations),), final_pass_used, dtype=torch.long
+            )
+        return AsyncOutput(
+            conversations,
+            sample_index,
+            final_mask,
+            timing_raw,
+            batch={"pass_used": pass_used.numpy()},
+        )
 
 
 # Important, we will import `REGISTER` from this file to get all registered classes.

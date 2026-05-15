@@ -103,6 +103,10 @@ def default_compute_score(
 
         res = search_r1_like_qa_em.compute_score(solution_str, ground_truth)
 
+    elif data_source in ['hotpotqa']:
+        from . import hotpotqa
+        res = hotpotqa.compute_score(solution_str, ground_truth, kwargs.get('prompt_str', None))
+
     else:
         raise NotImplementedError(f"Reward function is not implemented for {data_source=}")
 

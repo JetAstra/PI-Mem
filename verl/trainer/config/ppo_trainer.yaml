@@ -339,3 +339,33 @@ ray_kwargs:
 
   # Path to save Ray timeline JSON for performance profiling
   timeline_json_file: null
+
+# Ours
+recurrent:
+  enable: False
+  trival:
+    async_path: "recurrent/impls/async_trival.py"
+    async_name: REGISTER
+    config:
+      ~
+  memory:
+    path: "recurrent/impls/memory.py"
+    name: REGISTER
+    async_path: "recurrent/impls/async_memory.py"
+    async_name: REGISTER
+    config:
+      context_key: context
+      chunk_size: 5000
+      max_prompt_length: 1024
+      max_memorization_length: 1024
+      max_chunks: 8
+      max_final_response_length: 1024
+      max_passes: 3
+      max_merge_length: 1024
+      pass_reward_coef: 0.2
+  tool_gsm8k:
+    async_path: "recurrent/impls/async_tool_gsm8k.py"
+    async_name: REGISTER
+    config:
+      max_turn: 5
+      max_generation_per_turn: 256
