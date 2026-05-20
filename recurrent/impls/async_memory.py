@@ -1,3 +1,4 @@
+import asyncio
 import logging
 from typing import List, Optional, Tuple, Union, Dict
 from uuid import uuid4
@@ -169,25 +170,28 @@ class AsyncMemoryAgent(AsyncRAgent):
             final_pass_used = current_pass
             chunk_memories = []
             all_no_new_info = True
-            step = 0
+            # Process all chunks in this pass (parallel within pass).
+            total_chunks = math.ceil(context_length / chunk_size)
+            if total_chunks > self.config.max_chunks:
+                logger.warning(
+                    f"[AsyncMemoryAgent] {total_chunks=} exceeds {self.config.max_chunks=}, {context_length=}, {pass_num=}"
+                )
+            chunk_parallelism = int(getattr(self.config, "chunk_parallelism_per_sample", 0))
+            if chunk_parallelism <= 0:
+                chunk_parallelism = total_chunks
 
-            # Process all chunks in this pass
-            while step * chunk_size < context_length:
-                with _timer("mt_mics", timing_raw):
-                    assert (
-                        step < self.config.max_chunks
-                    ), f"{step=} exceeds {self.config.max_chunks=}, {context_length=}"
+            with _timer("mt_mics", timing_raw):
+                chunk_requests = []
+                for step in range(total_chunks):
                     chunk_ids = gen_item.batch["context_ids"][
                         step * chunk_size : (step + 1) * chunk_size
                     ]
                     chunk_ids = chunk_ids[chunk_ids != self.tokenizer.pad_token_id]
 
                     kwargs = self.sampling_params(gen_item.meta_info)
-                    if sample_index == 0:
+                    if sample_index == 0 and step == 0:
                         logger.info(f"generate_sequences sampling params: {kwargs}")
-                    kwargs["max_completion_tokens"] = (
-                        self.config.max_memorization_length
-                    )
+                    kwargs["max_completion_tokens"] = self.config.max_memorization_length
 
                     conversation = [
                         {
@@ -199,13 +203,26 @@ class AsyncMemoryAgent(AsyncRAgent):
                             ),
                         }
                     ]
+                    chunk_requests.append((step, conversation, kwargs))
+
+            chunk_outputs = []
+            for start in range(0, total_chunks, chunk_parallelism):
+                req_slice = chunk_requests[start : start + chunk_parallelism]
                 with _timer("mt_async_gen", timing_raw):
-                    completions, err = await self.proxy.get_chat_completions(
-                        messages=conversation, **kwargs
+                    out_slice = await asyncio.gather(
+                        *[
+                            self.proxy.get_chat_completions(messages=conversation, **kwargs)
+                            for _, conversation, kwargs in req_slice
+                        ]
                     )
+                chunk_outputs.extend(out_slice)
+
+            with _timer("mt_mics", timing_raw):
+                # Keep deterministic chunk order for logging/output consistency.
+                for (step, conversation, _), (completions, err) in zip(chunk_requests, chunk_outputs):
                     if err:
                         raise err
-                with _timer("mt_mics", timing_raw):
+
                     choice = completions.choices[0]
                     conversation.append(msg(choice))
                     conversations.append(conversation)
@@ -218,7 +235,6 @@ class AsyncMemoryAgent(AsyncRAgent):
                         all_no_new_info = False
                     if sample_index == 0:
                         log_step(logger, f"pass{pass_num}_chunk{step}", conversation)
-                step += 1
 
             # Check convergence: if all chunks returned [NO_NEW_INFO], skip merge and stop
             if all_no_new_info:
