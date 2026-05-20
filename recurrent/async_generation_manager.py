@@ -134,8 +134,29 @@ class AsyncLLMGenerationManager:
             left_pad=False,
             return_mask=True,
         )
+        try:
+            response_mask_tensors = [torch.from_numpy(arr) for arr in concated["response_mask"]]
+        except Exception:
+            logger.exception(
+                "Failed to convert `response_mask` to torch tensors. "
+                "This is usually caused by object-typed nested arrays."
+            )
+            for idx, arr in enumerate(concated["response_mask"]):
+                try:
+                    torch.from_numpy(arr)
+                except Exception as inner_exc:
+                    logger.error(
+                        "Bad response_mask[%d]: type=%s dtype=%s shape=%s err=%r",
+                        idx,
+                        type(arr),
+                        getattr(arr, "dtype", None),
+                        getattr(arr, "shape", None),
+                        inner_exc,
+                    )
+                    break
+            raise
         response_mask = pad_tensor_list_to_length(
-            [torch.from_numpy(arr) for arr in concated["response_mask"]],
+            response_mask_tensors,
             pad_token_id=0,
             left_pad=False,
         )
