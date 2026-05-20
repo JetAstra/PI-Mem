@@ -23,6 +23,7 @@ from typing import Optional
 
 import psutil
 import torch
+import loguru
 from codetiming import Timer
 from omegaconf import DictConfig, open_dict
 from tensordict import NonTensorData, TensorDict
@@ -443,6 +444,17 @@ class TrainingWorker(Worker, DistProfilerExtension):
                     disable_auto_offload=True,
                 )
                 actor_output = self.train_batch(mini_batch_td)
+                if actor_output is not None and self.engine.is_mp_src_rank_with_outputs():
+                    loguru.logger.debug(
+                        "[TrainingWorker][update_actor] iter={}/{} epoch={}/{} recurrent={} local_bsz={} global_bsz={}",
+                        batch_idx + 1,
+                        total_num_iterations,
+                        batch_idx // max(len(dataloader), 1) + 1,
+                        epochs,
+                        recurrent_actor_update,
+                        len(mini_batch_td),
+                        tu.get_non_tensor_data(mini_batch_td, key="global_batch_size", default="NA"),
+                    )
                 output_lst.append(actor_output)
 
             if self.engine.is_mp_src_rank_with_outputs():

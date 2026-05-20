@@ -1631,11 +1631,10 @@ class RayPPOTrainer:
                             ####################
                             # [MemAgent] Below is all about agents - the "LLM + forloop"
                             ####################
+                            loguru.logger.debug(f"[RayPPOTrainer] Rollout Start")
                             gen_batch_output, final_mask, sample_index = self.generation_manager.run_llm_loop(
                                 gen_batch, timing_raw
                             )
-                            # aa = torch.load('gen.pt', weights_only=False); print("[!!ERROR!!] 这里hard code调试")
-                            # gen_batch_output, final_mask, sample_index = aa.values()
                             # [MemAgent][MODIFIED] 广播 uid 用于 filter 过滤
                             gen_batch_output.non_tensor_batch["uid"] = batch.non_tensor_batch["uid"][sample_index]
 
@@ -1721,6 +1720,7 @@ class RayPPOTrainer:
                             images_seqlens_all.extend(multi_modal_input["images_seqlens"].tolist())
                     batch.meta_info["images_seqlens"] = images_seqlens_all
                     with marked_timer("reward", timing_raw, color="yellow"):
+                        loguru.logger.debug(f"[RayPPOTrainer] Compute Reward Start")
                         # compute reward model score
                         if self.use_rm and "rm_scores" not in batch.batch.keys():
                             # [MemAgent] 不支持添加 use_rm
@@ -1793,7 +1793,8 @@ class RayPPOTrainer:
 
                     if self.recurrent_enabled:  ###### [MemAgent]
                         # pad for log_prob
-                        pad_divisor = self._get_dp_size(self.actor_rollout_wg, "actor")
+                        assert self.config.actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu == self.config.actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu
+                        pad_divisor = self._get_dp_size(self.actor_rollout_wg, "actor") * self.config.actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu
                         batch, pad_size = pad_dataproto_to_divisor(batch, pad_divisor)
 
                     # Operating Mode Selection:
@@ -1815,6 +1816,7 @@ class RayPPOTrainer:
                         )
                     else:  # Recompute old_log_probs
                         with marked_timer("old_log_prob", timing_raw, color="blue"):
+                            loguru.logger.debug(f"[RayPPOTrainer] Compute Old Log Prob Start")
                             old_log_prob, old_log_prob_mfu = self._compute_old_log_prob(batch)
                             entropys = old_log_prob.batch["entropys"]
                             response_masks = batch.batch["response_mask"]
@@ -1851,6 +1853,7 @@ class RayPPOTrainer:
                     if self.use_reference_policy:
                         # compute reference log_prob
                         with marked_timer(str(Role.RefPolicy), timing_raw, color="olive"):
+                            loguru.logger.debug(f"[RayPPOTrainer] Compute Ref Log Prob Start")
                             ref_log_prob = self._compute_ref_log_prob(batch)
                             batch = batch.union(ref_log_prob)
 
@@ -1965,7 +1968,11 @@ class RayPPOTrainer:
                             # [MemAgent] ADD: paddding for actor updating.
                             ########
                             actor_dp_size = self._get_dp_size(self.actor_rollout_wg, "actor")
-                            update_divisor = actor_dp_size * self.recurrent_update_steps_per_batch
+                            update_divisor = (
+                                actor_dp_size
+                                * self.recurrent_update_steps_per_batch
+                                * self.config.actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu
+                            )
                             if len(batch) % update_divisor != 0:
                                 from recurrent.utils import graceful_padding
 
@@ -1980,6 +1987,7 @@ class RayPPOTrainer:
                                 # still need this to activate recurrent-related code in `update_actor`
                                 batch.batch["no_padding_mask"] = torch.ones(len(batch), dtype=torch.bool)
                         with marked_timer("update_actor", timing_raw, color="red"):
+                            loguru.logger.debug(f"[RayPPOTrainer] Compute Update Actor Start")
                             actor_output = self._update_actor(batch)
 
                         # Check if the ESI (Elastic Server Instance)/training plan is close to expiration.
@@ -2016,7 +2024,7 @@ class RayPPOTrainer:
 
                     # Log rollout generations if enabled
                     rollout_data_dir = self.config.trainer.get("rollout_data_dir", None)
-                    if rollout_data_dir:
+                    if rollout_data_dir and self.global_steps in [15, 20, 21]:
                         self._log_rollout_data(batch, reward_extra_infos_dict, timing_raw, rollout_data_dir)
 
                 # validate
