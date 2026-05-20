@@ -363,6 +363,7 @@ recurrent:
       max_passes: 3
       max_merge_length: 1024
       pass_reward_coef: 0.2
+      chunk_parallelism_per_sample: 0
   tool_gsm8k:
     async_path: "recurrent/impls/async_tool_gsm8k.py"
     async_name: REGISTER

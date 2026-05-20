@@ -105,6 +105,7 @@ class RLHFDataset(Dataset):
 
         self.cache_dir = os.path.expanduser(config.get("cache_dir", "~/.cache/verl/rlhf"))
         self.prompt_key = config.get("prompt_key", "prompt")
+        self.context_key = config.get("context_key", None)
         self.image_key = config.get("image_key", "images")
         self.video_key = config.get("video_key", "videos")
         self.image_patch_size = config.get("image_patch_size", 14)
@@ -140,8 +141,8 @@ class RLHFDataset(Dataset):
                 )
                 self.tool_schemas = None
 
-        self.num_workers = config.get("filter_overlong_prompts_workers", max(1, os.cpu_count() // 4))
-        self.num_workers = min(self.num_workers, os.cpu_count()) if self.num_workers is not None else None
+        self.num_workers = config.get("filter_overlong_prompts_workers", max(1, len(os.sched_getaffinity(0)) // 4))
+        self.num_workers = min(self.num_workers, len(os.sched_getaffinity(0))) if self.num_workers is not None else None
         self.use_shm = config.get("use_shm", False)
         self.chat_template_func = config.get("chat_template_func", None)
         self.need_tools_kwargs = config.get("need_tools_kwargs", False)
@@ -197,6 +198,9 @@ class RLHFDataset(Dataset):
             prompt_key = self.prompt_key
             image_key = self.image_key
             video_key = self.video_key
+            context_key = getattr(self, "context_key", None)
+            if context_key is not None:
+                logger.warning(f"[RLHFDataset][RECURRENT] {context_key=} is provided for memagent.")
 
             if processor is not None:
                 from verl.utils.dataset.vision_utils import process_image, process_video
@@ -270,8 +274,21 @@ class RLHFDataset(Dataset):
                         apply_kwargs.pop("return_dict", None)
                         apply_kwargs.pop("return_tensors", None)
 
+                        messages = doc[prompt_key]
+                        if context_key is not None:
+                            # [MemAgent] 对于 memagent 数据需要加上 context 部分的长度
+                            context = doc[context_key]
+                            assert isinstance(context, str), f"{context_key} must be str, got {type(context)}"
+
+                            user_idx = next((i for i, msg in enumerate(messages) if msg.get("role") == "user"), None)
+                            assert user_idx is not None, f"{prompt_key} must contain at least one user message"
+                            # Keep filtering logic read-only to avoid mutating source rows in multiprocessing.
+                            messages = [
+                                {**msg, "content": f"{msg['content']}\n\n{context}"} if i == user_idx else msg
+                                for i, msg in enumerate(messages)
+                            ]
                         tokenized_prompt = tokenizer.apply_chat_template(
-                            doc[prompt_key], add_generation_prompt=True, tokenize=True, **apply_kwargs
+                            messages, add_generation_prompt=True, tokenize=True, **apply_kwargs
                         )
                         return len(normalize_token_ids(tokenized_prompt))
                     except Exception:
@@ -279,10 +296,11 @@ class RLHFDataset(Dataset):
                         traceback.print_exc()
                         return self.max_prompt_length + 1
 
+            max_prompt_length = self.max_prompt_length  # 不要传 self, 无法序列化
             dataframe = dataframe.filter(
-                lambda doc: doc2len(doc) <= self.max_prompt_length,
+                lambda doc: doc2len(doc) <= max_prompt_length,
                 num_proc=self.num_workers,
-                desc=f"Filtering prompts longer than {self.max_prompt_length} tokens",
+                desc=f"Filtering prompts longer than {max_prompt_length} tokens",
             )
 
             print(f"filter dataset len: {len(dataframe)}")

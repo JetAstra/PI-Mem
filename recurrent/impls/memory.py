@@ -30,6 +30,9 @@ class MemoryConfig(RConfig):
     max_passes: int = 3  # number of full pass→merge iterations
     max_merge_length: int = 2048  # max output tokens for the merge step
     pass_reward_coef: float = 0.0  # add-on reward: fewer passes -> higher bonus
+    # Async memory only: cap concurrent chunk requests per sample in one pass.
+    # <=0 means no cap (launch all chunks in parallel, current behavior).
+    chunk_parallelism_per_sample: int = 0
     no_new_info_marker: str = (
         "<check>no</check>"  # marker the model outputs when chunk has no new info
     )
