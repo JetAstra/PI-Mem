@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import time
 from typing import List, Optional, Tuple, Union, Dict
 from uuid import uuid4
 
@@ -13,7 +14,7 @@ from recurrent.async_utils import ChatCompletionProxy
 
 
 from recurrent.interface import AsyncRAgent, RConfig, RDataset, RRegister, AsyncOutput
-from recurrent.utils import log_step, msg
+from recurrent.utils import msg
 from verl.protocol import DataProtoItem
 from recurrent.generation_manager import _timer
 import verl.utils.torch_functional as verl_F
@@ -147,6 +148,11 @@ class AsyncMemoryAgent(AsyncRAgent):
     ):
         super().__init__(proxy, tokenizer, config, rollout_config)
 
+    @staticmethod
+    def _is_trace_sample(sample_index: int) -> bool:
+        # Keep logs sparse: only emit stage-progress lines for one sample.
+        return sample_index == 0
+
     @override
     async def rollout(self, gen_item: DataProtoItem) -> AsyncOutput:
         """
@@ -164,6 +170,18 @@ class AsyncMemoryAgent(AsyncRAgent):
         final_pass_used = 1
         self.config: MemoryConfig
         chunk_size = self.config.chunk_size
+        chunk_parallelism = int(getattr(self.config, "chunk_parallelism_per_sample", 0))
+        if chunk_parallelism <= 0:
+            chunk_parallelism = max(1, math.ceil(context_length / chunk_size))
+
+        if self._is_trace_sample(sample_index):
+            logger.info(
+                "[Recurrent][Stage] sample=%d phase=start chunks=%d chunk_parallelism=%d max_passes=%d",
+                sample_index,
+                math.ceil(context_length / chunk_size),
+                chunk_parallelism,
+                self.config.max_passes,
+            )
 
         for pass_num in range(self.config.max_passes):
             current_pass = pass_num + 1
@@ -176,10 +194,6 @@ class AsyncMemoryAgent(AsyncRAgent):
                 logger.warning(
                     f"[AsyncMemoryAgent] {total_chunks=} exceeds {self.config.max_chunks=}, {context_length=}, {pass_num=}"
                 )
-            chunk_parallelism = int(getattr(self.config, "chunk_parallelism_per_sample", 0))
-            if chunk_parallelism <= 0:
-                chunk_parallelism = total_chunks
-
             with _timer("mt_mics", timing_raw):
                 chunk_requests = []
                 for step in range(total_chunks):
@@ -189,8 +203,6 @@ class AsyncMemoryAgent(AsyncRAgent):
                     chunk_ids = chunk_ids[chunk_ids != self.tokenizer.pad_token_id]
 
                     kwargs = self.sampling_params(gen_item.meta_info)
-                    if sample_index == 0 and step == 0:
-                        logger.info(f"generate_sequences sampling params: {kwargs}")
                     kwargs["max_completion_tokens"] = self.config.max_memorization_length
 
                     conversation = [
@@ -208,19 +220,50 @@ class AsyncMemoryAgent(AsyncRAgent):
             chunk_outputs = []
             for start in range(0, total_chunks, chunk_parallelism):
                 req_slice = chunk_requests[start : start + chunk_parallelism]
-                with _timer("mt_async_gen", timing_raw):
-                    out_slice = await asyncio.gather(
-                        *[
-                            self.proxy.get_chat_completions(messages=conversation, **kwargs)
-                            for _, conversation, kwargs in req_slice
-                        ]
+                if self._is_trace_sample(sample_index):
+                    logger.info(
+                        "[Recurrent][Stage] sample=%d phase=chunk pass=%d window=%d-%d/%d size=%d",
+                        sample_index,
+                        current_pass,
+                        start + 1,
+                        start + len(req_slice),
+                        total_chunks,
+                        len(req_slice),
                     )
+                gen_t0 = time.perf_counter()
+                with _timer("mt_async_gen", timing_raw):
+                    try:
+                        out_slice = await asyncio.gather(
+                            *[
+                                self.proxy.get_chat_completions(messages=conversation, **kwargs)
+                                for _, conversation, kwargs in req_slice
+                            ]
+                        )
+                    except Exception:
+                        logger.exception(
+                            "[Recurrent][StageError] sample=%d phase=chunk pass=%d window=%d-%d/%d elapsed=%.2fs",
+                            sample_index,
+                            current_pass,
+                            start + 1,
+                            start + len(req_slice),
+                            total_chunks,
+                            time.perf_counter() - gen_t0,
+                        )
+                        raise
                 chunk_outputs.extend(out_slice)
 
             with _timer("mt_mics", timing_raw):
                 # Keep deterministic chunk order for logging/output consistency.
                 for (step, conversation, _), (completions, err) in zip(chunk_requests, chunk_outputs):
                     if err:
+                        logger.exception(
+                            "[Recurrent][StageError] sample=%d phase=chunk pass=%d step=%d/%d",
+                            sample_index,
+                            current_pass,
+                            step + 1,
+                            total_chunks,
+                            exc_info=err,
+                        )
                         raise err
 
                     choice = completions.choices[0]
@@ -233,15 +276,15 @@ class AsyncMemoryAgent(AsyncRAgent):
                     else:
                         chunk_memories.append(content)
                         all_no_new_info = False
-                    if sample_index == 0:
-                        log_step(logger, f"pass{pass_num}_chunk{step}", conversation)
 
             # Check convergence: if all chunks returned [NO_NEW_INFO], skip merge and stop
             if all_no_new_info:
-                if sample_index == 0:
+                if self._is_trace_sample(sample_index):
                     logger.info(
-                        f"[Recurrent][CONVERGENCE] Sample converged at pass {pass_num} "
-                        f"(all chunks returned {self.config.no_new_info_marker})"
+                        "[Recurrent][Stage] sample=%d phase=converged pass=%d marker=%s",
+                        sample_index,
+                        current_pass,
+                        self.config.no_new_info_marker,
                     )
                 break
 
@@ -263,19 +306,41 @@ class AsyncMemoryAgent(AsyncRAgent):
                         ),
                     }
                 ]
-            with _timer("mt_async_gen", timing_raw):
-                completions, err = await self.proxy.get_chat_completions(
-                    messages=merge_conversation, **kwargs
+            if self._is_trace_sample(sample_index):
+                logger.info(
+                    "[Recurrent][Stage] sample=%d phase=merge pass=%d non_empty_chunks=%d/%d",
+                    sample_index,
+                    current_pass,
+                    sum(m is not None for m in chunk_memories),
+                    total_chunks,
                 )
+            merge_t0 = time.perf_counter()
+            with _timer("mt_async_gen", timing_raw):
+                try:
+                    completions, err = await self.proxy.get_chat_completions(
+                        messages=merge_conversation, **kwargs
+                    )
+                except Exception:
+                    logger.exception(
+                        "[Recurrent][StageError] sample=%d phase=merge pass=%d elapsed=%.2fs",
+                        sample_index,
+                        current_pass,
+                        time.perf_counter() - merge_t0,
+                    )
+                    raise
             with _timer("mt_mics", timing_raw):
                 if err:
+                    logger.exception(
+                        "[Recurrent][StageError] sample=%d phase=merge pass=%d",
+                        sample_index,
+                        current_pass,
+                        exc_info=err,
+                    )
                     raise err
                 choice = completions.choices[0]
                 merge_conversation.append(msg(choice))
                 conversations.append(merge_conversation)
                 global_memory = merge_conversation[-1]["content"].strip()
-                if sample_index == 0:
-                    log_step(logger, f"pass{pass_num}_merge", merge_conversation)
 
         # Final turn: generate answer from global memory
         with _timer("mt_mics", timing_raw):
@@ -290,18 +355,38 @@ class AsyncMemoryAgent(AsyncRAgent):
             ]
             kwargs = self.sampling_params(gen_item.meta_info)
             kwargs["max_completion_tokens"] = self.config.max_final_response_length
-        with _timer("mt_async_gen", timing_raw):
-            completions, err = await self.proxy.get_chat_completions(
-                messages=conversation, **kwargs
+        if self._is_trace_sample(sample_index):
+            logger.info(
+                "[Recurrent][Stage] sample=%d phase=final pass_used=%d",
+                sample_index,
+                final_pass_used,
             )
+        final_t0 = time.perf_counter()
+        with _timer("mt_async_gen", timing_raw):
+            try:
+                completions, err = await self.proxy.get_chat_completions(
+                    messages=conversation, **kwargs
+                )
+            except Exception:
+                logger.exception(
+                    "[Recurrent][StageError] sample=%d phase=final pass=%d elapsed=%.2fs",
+                    sample_index,
+                    final_pass_used,
+                    time.perf_counter() - final_t0,
+                )
+                raise
         with _timer("mt_mics", timing_raw):
             if err:
+                logger.exception(
+                    "[Recurrent][StageError] sample=%d phase=final pass=%d",
+                    sample_index,
+                    final_pass_used,
+                    exc_info=err,
+                )
                 raise err
             choice = completions.choices[0]
             conversation.append(msg(choice))
             conversations.append(conversation)
-            if sample_index == 0:
-                log_step(logger, "final", conversation)
 
             sample_index = torch.full(
                 (len(conversations),), sample_index, dtype=torch.long
