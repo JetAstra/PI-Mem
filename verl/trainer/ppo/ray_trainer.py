@@ -21,6 +21,8 @@ This trainer supports model-agonistic model initialization with huggingface
 import json
 import os
 import uuid
+import importlib
+import importlib.util
 from collections import defaultdict
 from pprint import pprint
 from typing import Any, Optional
@@ -72,6 +74,42 @@ from verl.workers.config import DistillationConfig, EngineConfig
 from verl.workers.rollout.llm_server import LLMServerManager
 from verl.workers.utils.padding import left_right_2_no_padding, no_padding_2_padding
 from recurrent.utils import clip_long_string
+
+
+def _load_register_from_file(file_path: str, obj_name: str):
+    if not os.path.exists(file_path):
+        raise FileNotFoundError(f"Recurrent implementation file '{file_path}' not found.")
+
+    spec = importlib.util.spec_from_file_location("custom_recurrent_module", file_path)
+    if spec is None or spec.loader is None:
+        raise FileNotFoundError(f"Failed to create module spec for '{file_path}'.")
+    module = importlib.util.module_from_spec(spec)
+    try:
+        spec.loader.exec_module(module)
+    except Exception as e:
+        raise RuntimeError(f"Error loading module from '{file_path}': {e}") from e
+
+    if not hasattr(module, obj_name):
+        raise AttributeError(f"Register object '{obj_name}' not found in '{file_path}'.")
+    register = getattr(module, obj_name)
+    for attr in ("config_cls", "dataset_cls", "agent_cls"):
+        if not hasattr(register, attr):
+            raise TypeError(f"Object '{obj_name}' in '{file_path}' is missing required attribute '{attr}'.")
+    print(f"[RECURRENT] recurrent enabled, using register '{obj_name}' from '{file_path}'.")
+    return register
+
+
+def _load_async_generation_manager_cls(async_path: str):
+    norm_path = os.path.normpath(async_path)
+    parts = norm_path.split(os.sep)
+    if "memagent" in parts:
+        package = "memagent"
+    elif "recurrent" in parts:
+        package = "recurrent"
+    else:
+        package = "recurrent"
+    module = importlib.import_module(f"{package}.async_generation_manager")
+    return module.AsyncLLMGenerationManager
 
 
 def apply_kl_penalty(data: DataProto, kl_ctrl: core_algos.AdaptiveKLController, kl_penalty="kl"):
@@ -420,13 +458,12 @@ class RayPPOTrainer:
         # [MemAgent][TODO] check consistency with implementation in `init_worker`
         self.recurrent_enabled = bool(self.config.recurrent.enable)
         if self.recurrent_enabled:
-            from recurrent.interface import RRegister
-
             enabled_conf = getattr(self.config.recurrent, self.config.recurrent.enable)
             assert hasattr(enabled_conf, "async_path") and hasattr(enabled_conf, "async_name"), (
                 f"`async_path` and `async_name` must be set in recurrent.{self.config.recurrent.enable}"
             )
-            self.recurrent_register = RRegister.from_filename(enabled_conf.async_path, enabled_conf.async_name)
+            self.recurrent_async_path = enabled_conf.async_path
+            self.recurrent_register = _load_register_from_file(enabled_conf.async_path, enabled_conf.async_name)
 
             conf = dict(enabled_conf.config) if enabled_conf.config is not None else {}
             self.recurrent_config = self.recurrent_register.config_cls(**conf)
@@ -444,6 +481,7 @@ class RayPPOTrainer:
                 self.recurrent_update_steps_per_batch * self.recurrent_actor_ppo_mini_batch_size
             )
         else:
+            self.recurrent_async_path = None
             self.recurrent_register = None
             self.recurrent_config = None
             self.recurrent_update_steps_per_batch = None
@@ -1083,7 +1121,7 @@ class RayPPOTrainer:
             )
         else:
             # [MemAgent] create generation manager for recurrent rollout
-            from recurrent.async_generation_manager import AsyncLLMGenerationManager
+            AsyncLLMGenerationManager = _load_async_generation_manager_cls(self.recurrent_async_path)
 
             self.async_rollout_manager = None
             self.generation_manager = AsyncLLMGenerationManager(
