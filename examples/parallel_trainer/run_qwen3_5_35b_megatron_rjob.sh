@@ -31,7 +31,7 @@
 #
 
 # bash /mnt/shared-storage-user/liudawei/home/verl-new/examples/parallel_trainer/run_qwen3_5_35b_megatron_rjob.sh
-set -x
+set -xueo pipefail
 cd /mnt/shared-storage-user/liudawei/home/verl-new/
 source /mnt/shared-storage-user/liudawei/miniforge3/etc/profile.d/conda.sh
 conda activate /mnt/shared-storage-user/liudawei/envs/verl-071
@@ -41,8 +41,6 @@ ray stop -f
 export CUDA_DEVICE_MAX_CONNECTIONS=1
 export VLLM_USE_V1=1
 export VLLM_ALLREDUCE_USE_SYMM_MEM=0
-
-export HOME=/mnt/shared-storage-user/liudawei/home/
 
 export NNODES=4
 
@@ -55,9 +53,9 @@ export HF_HUB_OFFLINE=1
 export PYTHONUNBUFFERED=1
 export VERL_LOGGING_LEVEL=DEBUG
 
-export VLLM_RPC_TIMEOUT=1600
-export VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS=1200
-export VLLM_ENGINE_ITERATION_TIMEOUT_S=400
+export VLLM_RPC_TIMEOUT=320000
+export VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS=36000
+export VLLM_ENGINE_ITERATION_TIMEOUT_S=16000
 
 #### for debug?
 # dont use export PYTORCH_ALLOC_CONF=expandable_segments:True!!
@@ -119,7 +117,7 @@ RECURRENT=(
     recurrent.memory.config.max_memorization_length=${resp_len}
     recurrent.memory.config.max_final_response_length=${resp_len}
     recurrent.memory.config.pass_reward_coef=0.2
-    recurrent.memory.config.chunk_parallelism_per_sample=0
+    recurrent.memory.config.chunk_parallelism_per_sample=3
 )
 
 MODEL=(
@@ -131,6 +129,7 @@ MODEL=(
 ACTOR=(
     actor_rollout_ref.actor.optim.lr_warmup_steps=20
     actor_rollout_ref.actor.optim.lr=1e-6
+    actor_rollout_ref.actor.optim.use_checkpoint_opt_param_scheduler=True
     actor_rollout_ref.actor.clip_ratio_high=0.20
     actor_rollout_ref.actor.ppo_mini_batch_size=8
     actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=2
@@ -322,6 +321,3 @@ else
         sleep 10
     done
 fi
-
-# Another task:
-bash /mnt/shared-storage-user/liudawei/home/LLaMA-Factory/examples/shell/lmf-qwen3-dense-ar.sh
