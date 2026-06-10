@@ -1707,6 +1707,7 @@ class RayPPOTrainer:
                             workflow_metrics = gen_batch_output.meta_info.pop("metrics", {})
                             metrics.update(workflow_metrics)
                         self.checkpoint_manager.sleep_replicas()
+
                         if curr_step_profile:
                             self.llm_server_manager.stop_profile()
 
@@ -1818,7 +1819,13 @@ class RayPPOTrainer:
                         kept_traj_idxs = np.array(kept_traj_idxs, dtype=int)
 
                         if len(kept_traj_idxs) == 0:
-                            print("[Filter Groups] It was detected that all the advantages are 0. This step is skipped.")
+                            loguru.logger.warning("[Filter Groups] It was detected that all the advantages are 0. This step is skipped.")
+                            # Keep rollout engine lifecycle consistent with a normal training step.
+                            # Actor weights are unchanged, but update_weights refreshes/clears rollout-side
+                            # state before the next rollout, avoiding vLLM KV/block-manager stale state.
+                            with marked_timer("update_weights", timing_raw, color="red"):
+                                self.checkpoint_manager.update_weights(self.global_steps)
+
                             progress_bar.update(1)
                             self.global_steps += 1
                             continue
@@ -2062,7 +2069,7 @@ class RayPPOTrainer:
 
                     # Log rollout generations if enabled
                     rollout_data_dir = self.config.trainer.get("rollout_data_dir", None)
-                    if rollout_data_dir and self.global_steps in [15, 20, 21]:
+                    if rollout_data_dir:
                         self._log_rollout_data(batch, reward_extra_infos_dict, timing_raw, rollout_data_dir)
 
                 # validate
