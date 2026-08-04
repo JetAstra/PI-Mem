@@ -1,5 +1,7 @@
+import asyncio
 import logging
-from typing import List, Optional, Tuple, Union, Dict
+import math
+from typing import Dict, List, Optional, Tuple, Union
 from uuid import uuid4
 
 import torch
@@ -44,9 +46,41 @@ class AsyncMemoryDataset(RDataset):
     ):
         if data_config.truncation != "middle":
             raise ValueError("MemoryDataset only support center truncation")
-        data_config.max_prompt_length = (
-            recurrent_config.max_chunks * recurrent_config.chunk_size
-        )
+        chunk_size = recurrent_config.chunk_size
+        old_max_chunks = recurrent_config.max_chunks
+        old_max_prompt_length = data_config.max_prompt_length
+
+        # If both are set, trust prompt-length budget and align max_chunks by ceil.
+        if old_max_chunks is not None and old_max_prompt_length is not None:
+            new_max_chunks = math.ceil(old_max_prompt_length / chunk_size)
+            recurrent_config.max_chunks = new_max_chunks
+            data_config.max_prompt_length = new_max_chunks * chunk_size
+            logger.info(
+                "[MemoryDataset] recompute by max_prompt_length/chunk_size: "
+                f"max_chunks {old_max_chunks} -> {new_max_chunks}, "
+                f"max_prompt_length {old_max_prompt_length} -> {data_config.max_prompt_length} "
+                f"(chunk_size={recurrent_config.chunk_size})"
+            )
+        elif old_max_chunks is None and old_max_prompt_length is not None:
+            recurrent_config.max_chunks = math.ceil(old_max_prompt_length / chunk_size)
+            data_config.max_prompt_length = recurrent_config.max_chunks * chunk_size
+            logger.info(
+                "[MemoryDataset] infer max_chunks from max_prompt_length: "
+                f"max_chunks None -> {recurrent_config.max_chunks}, "
+                f"max_prompt_length {old_max_prompt_length} -> {data_config.max_prompt_length} "
+                f"(chunk_size={recurrent_config.chunk_size})"
+            )
+        elif old_max_chunks is not None:
+            data_config.max_prompt_length = old_max_chunks * chunk_size
+            logger.info(
+                "[MemoryDataset] infer max_prompt_length from max_chunks: "
+                f"max_chunks {recurrent_config.max_chunks}, "
+                f"max_prompt_length {data_config.max_prompt_length} "
+                f"(chunk_size={recurrent_config.chunk_size})"
+            )
+        else:
+            raise ValueError("Either recurrent_config.max_chunks or data_config.max_prompt_length must be set.")
+
         self.context_key = recurrent_config.context_key
         logger.info(f"[Check Recurrent Cfg] {recurrent_config}\n")
         super().__init__(
@@ -130,25 +164,22 @@ class AsyncMemoryAgent(AsyncRAgent):
         for pass_num in range(self.config.max_passes):
             chunk_memories = []
             all_no_new_info = True
-            step = 0
+            chunk_count = math.ceil(context_length / chunk_size)
+            assert (
+                chunk_count <= self.config.max_chunks
+            ), f"{chunk_count=} exceeds {self.config.max_chunks=}, {context_length=}"
 
-            # Process all chunks in this pass
-            while step * chunk_size < context_length:
+            async def rollout_one_chunk(step: int):
                 with _timer("mt_mics", timing_raw):
-                    assert (
-                        step < self.config.max_chunks
-                    ), f"{step=} exceeds {self.config.max_chunks=}, {context_length=}"
                     chunk_ids = gen_item.batch["context_ids"][
                         step * chunk_size : (step + 1) * chunk_size
                     ]
-
                     kwargs = self.sampling_params(gen_item.meta_info)
-                    if sample_index == 0:
+                    if sample_index == 0 and step == 0:
                         logger.info(f"generate_sequences sampling params: {kwargs}")
                     kwargs["max_completion_tokens"] = (
                         self.config.max_memorization_length
                     )
-
                     conversation = [
                         {
                             "role": "user",
@@ -165,13 +196,19 @@ class AsyncMemoryAgent(AsyncRAgent):
                             ),
                         }
                     ]
-                with _timer("mt_async_gen", timing_raw):
-                    completions, err = await self.proxy.get_chat_completions(
-                        messages=conversation, **kwargs
-                    )
+                completions, err = await self.proxy.get_chat_completions(
+                    messages=conversation, **kwargs
+                )
+                return step, conversation, completions, err
+
+            with _timer("mt_async_gen", timing_raw):
+                chunk_results = await asyncio.gather(
+                    *[rollout_one_chunk(step) for step in range(chunk_count)]
+                )
+            with _timer("mt_mics", timing_raw):
+                for step, conversation, completions, err in chunk_results:
                     if err:
                         raise err
-                with _timer("mt_mics", timing_raw):
                     choice = completions.choices[0]
                     conversation.append(msg(choice))
                     conversations.append(conversation)
@@ -184,7 +221,6 @@ class AsyncMemoryAgent(AsyncRAgent):
                         all_no_new_info = False
                     if sample_index == 0:
                         log_step(logger, f"pass{pass_num}_chunk{step}", conversation)
-                step += 1
 
             # Check convergence: if all chunks returned [NO_NEW_INFO], skip merge and stop
             if all_no_new_info:
