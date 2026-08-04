@@ -1,3 +1,0 @@
-[submodule "taskutils/LongBench"]
-	path = taskutils/LongBench
-	url = https://github.com/THUDM/LongBench
