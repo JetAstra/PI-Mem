@@ -108,7 +108,6 @@ ENV/
 .ropeproject
 
 # vscode
-.vscode
 
 # Mac
 .DS_Store
@@ -132,5 +131,6 @@ log
 outputs
 .history
 
+3rdparty/
 data/
 hotpotqa/
