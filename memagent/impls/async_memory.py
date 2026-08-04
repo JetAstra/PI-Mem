@@ -1,5 +1,6 @@
 import logging
 import math
+import time
 from typing import List, Optional, Tuple, Union, Dict
 from uuid import uuid4
 
@@ -128,6 +129,19 @@ class AsyncMemoryDataset(RDataset):
 class AsyncMemoryAgent(AsyncRAgent):
     def __init__(self, proxy: ChatCompletionProxy, tokenizer: PreTrainedTokenizer, config: RConfig, rollout_config: DictConfig):
         super().__init__(proxy, tokenizer, config, rollout_config)
+
+    def start(self, gen_batch, timing_raw: dict):
+        self._debug_progress = {}
+
+    def _set_debug_progress(self, sample_index: int, phase: str, step: int, **kwargs):
+        state = {
+            "phase": phase,
+            "step": step,
+            "updated_at": time.monotonic(),
+        }
+        state.update(kwargs)
+        self._debug_progress[sample_index] = state
+
     @override
     async def rollout(self, gen_item: DataProtoItem) -> AsyncOutput:
         """
@@ -142,6 +156,12 @@ class AsyncMemoryAgent(AsyncRAgent):
         step = 0
         conversations = []
         memory = None
+        self._set_debug_progress(
+            sample_index,
+            "start",
+            step,
+            context_length=context_length,
+        )
         while True:
             with _timer('mt_mics', timing_raw):
                 if step * self.config.chunk_size >= context_length:
@@ -164,18 +184,66 @@ class AsyncMemoryAgent(AsyncRAgent):
                         chunk=self.tokenizer.decode(chunk_ids, skip_special_tokens=True),
                     )}
                 ]
+                request_id = f"memagent-s{sample_index}-memory-{step}-{uuid4().hex[:8]}"
+                prompt_chars = len(conversation[0]["content"])
+                self._set_debug_progress(
+                    sample_index,
+                    "memory_request",
+                    step,
+                    context_length=context_length,
+                    chunk_tokens=int(chunk_ids.numel()),
+                    prompt_chars=prompt_chars,
+                    request_id=request_id,
+                    max_tokens=kwargs["max_completion_tokens"],
+                )
+                if sample_index < 8 or sample_index % 128 == 0:
+                    logger.info(
+                        "[MemAgent][sample] request sample=%d phase=memory step=%d chunk_tokens=%d "
+                        "prompt_chars=%d max_tokens=%d request_id=%s",
+                        sample_index,
+                        step,
+                        int(chunk_ids.numel()),
+                        prompt_chars,
+                        kwargs["max_completion_tokens"],
+                        request_id,
+                    )
             with _timer('mt_async_gen', timing_raw):
                 completions, err = await self.proxy.get_chat_completions(
                     messages=conversation,
+                    extra_headers={"x-request-id": f"chatcmpl-{request_id}"},
                     **kwargs
                 )
                 if err:
+                    self._set_debug_progress(
+                        sample_index,
+                        "failed",
+                        step,
+                        context_length=context_length,
+                        prompt_chars=prompt_chars,
+                        request_id=request_id,
+                    )
                     raise err
             with _timer('mt_mics', timing_raw):
                 choice = completions.choices[0]
                 conversation.append(msg(choice))
                 conversations.append(conversation)
                 memory = conversation[-1]["content"]
+                self._set_debug_progress(
+                    sample_index,
+                    "memory_response",
+                    step,
+                    context_length=context_length,
+                    prompt_chars=prompt_chars,
+                    request_id=request_id,
+                    response_chars=len(memory),
+                )
+                if sample_index < 8 or sample_index % 128 == 0:
+                    logger.info(
+                        "[MemAgent][sample] response sample=%d phase=memory step=%d response_chars=%d",
+                        sample_index,
+                        step,
+                        len(memory),
+                    )
                 if sample_index == 0:
                     log_step(logger, step, conversation)
             step += 1
@@ -193,23 +261,76 @@ class AsyncMemoryAgent(AsyncRAgent):
             ]
             kwargs = self.sampling_params(gen_item.meta_info)
             kwargs["max_completion_tokens"] = self.config.max_final_response_length
+            request_id = f"memagent-s{sample_index}-final-{step}-{uuid4().hex[:8]}"
+            prompt_chars = len(conversation[0]["content"])
+            self._set_debug_progress(
+                sample_index,
+                "final_request",
+                step,
+                context_length=context_length,
+                prompt_chars=prompt_chars,
+                request_id=request_id,
+                max_tokens=kwargs["max_completion_tokens"],
+            )
+            if sample_index < 8 or sample_index % 128 == 0:
+                logger.info(
+                    "[MemAgent][sample] request sample=%d phase=final step=%d prompt_chars=%d "
+                    "max_tokens=%d request_id=%s",
+                    sample_index,
+                    step,
+                    prompt_chars,
+                    kwargs["max_completion_tokens"],
+                    request_id,
+                )
         with _timer('mt_async_gen', timing_raw):
             completions, err = await self.proxy.get_chat_completions(
                 messages=conversation,
+                extra_headers={"x-request-id": f"chatcmpl-{request_id}"},
                 **kwargs
             )
         with _timer('mt_mics', timing_raw):
             if err:
+                self._set_debug_progress(
+                    sample_index,
+                    "failed",
+                    step,
+                    context_length=context_length,
+                    prompt_chars=prompt_chars,
+                    request_id=request_id,
+                )
                 raise err
             choice = completions.choices[0]
             conversation.append(msg(choice))
             conversations.append(conversation)
+            self._set_debug_progress(
+                sample_index,
+                "final_response",
+                step,
+                context_length=context_length,
+                prompt_chars=prompt_chars,
+                request_id=request_id,
+                response_chars=len(conversation[-1]["content"]),
+            )
+            if sample_index < 8 or sample_index % 128 == 0:
+                logger.info(
+                    "[MemAgent][sample] response sample=%d phase=final step=%d response_chars=%d",
+                    sample_index,
+                    step,
+                    len(conversation[-1]["content"]),
+                )
             if sample_index == 0:
                 log_step(logger, step, conversation)
 
             sample_index = torch.full((len(conversations),), sample_index, dtype=torch.long)
             final_mask = torch.full((len(conversations),), False, dtype=torch.bool)
             final_mask[-1] = True
+        self._set_debug_progress(
+            int(sample_index[0].item()),
+            "done",
+            step,
+            context_length=context_length,
+            turns=len(conversations),
+        )
         return AsyncOutput(conversations, sample_index, final_mask, timing_raw)
 
 
