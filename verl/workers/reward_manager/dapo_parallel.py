@@ -144,7 +144,7 @@ class DAPORewardManagerParallel:
         reward_fn_key="data_source",
         max_resp_len=None,
         overlong_buffer_cfg=None,
-        num_workers: int = 32,
+        num_workers: int = 4,
     ) -> None:
         self.tokenizer = tokenizer
         self.num_examine = num_examine
