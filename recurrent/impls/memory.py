@@ -310,10 +310,10 @@ class MemoryAgent(RAgent):
                 self.converged[i] = True
                 if self.sample_pass_used[i] < 0:
                     self.sample_pass_used[i] = self.pass_num + 1
-                logger.info(
-                    f"[CONVERGENCE] Sample {i} converged at pass {self.pass_num} "
-                    f"(all chunks returned {self.config.no_new_info_marker})"
-                )
+                # logger.info(
+                #     f"[CONVERGENCE] Sample {i} converged at pass {self.pass_num} "
+                #     f"(all chunks returned {self.config.no_new_info_marker})"
+                # )
 
     def _finalize_sample_pass_used(self, final_pass: int):
         final_pass = max(int(final_pass), 1)
@@ -344,9 +344,9 @@ class MemoryAgent(RAgent):
                 self.pass_num += 1
                 self._finalize_sample_pass_used(self.pass_num)
                 self.phase = "final"
-                logger.info(
-                    f"[CONVERGENCE] All samples converged at pass {self.pass_num - 1}, skipping merge"
-                )
+                # logger.info(
+                #     f"[CONVERGENCE] All samples converged at pass {self.pass_num - 1}, skipping merge"
+                # )
                 return self._final_action()
             else:
                 self.phase = "merge"

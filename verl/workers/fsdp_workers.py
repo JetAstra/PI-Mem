@@ -256,13 +256,17 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         # normalize config
         if self._is_actor:
             #######
-            # [MemAgent][TODO] ADD: actor must aware how many steps are there in a batch, since we may have variant of batch sizes
-            # 需要检查一下, 这里 train_batch_size 会额外乘以 rollout.n, 原始没有这个逻辑
+            # [MemAgent] ADD: actor must aware how many steps are there in a batch, since we may have variant of batch sizes
+
+            # Original Code:
+            # self.config.actor.ppo_mini_batch_size *= self.config.rollout.n
+            # self.config.actor.ppo_mini_batch_size //= self.device_mesh.size() // self.ulysses_sequence_parallel_size
             #######
             update_steps_per_batch = self.config.actor.train_batch_size // self.config.actor.ppo_mini_batch_size
             self.config.actor.ppo_mini_batch_size *= self.config.rollout.n
             self.config.actor.ppo_mini_batch_size //= self.device_mesh.size() // self.ulysses_sequence_parallel_size
-            self.config.actor.train_batch_size = update_steps_per_batch * self.config.actor.ppo_mini_batch_size
+            self.config.actor.train_batch_size = update_steps_per_batch * self.config.actor.ppo_mini_batch_size  # update train_batch_size
+            #######
             assert self.config.actor.ppo_mini_batch_size > 0, f"ppo_mini_batch_size {self.config.actor.ppo_mini_batch_size} should be larger than 0 after normalization"
             # micro bsz
             if self.config.actor.ppo_micro_batch_size is not None:
@@ -752,6 +756,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
         return output
 
+    # [MemAgent] used for recurrent/generation_manager.py
     @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
     @DistProfiler.annotate(color="red")
     def rollout_session_begin(self, _: DataProto):
@@ -761,6 +766,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             self._rollout_session_active = True
         return DataProto()
 
+    # [MemAgent] used for recurrent/generation_manager.py
     @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
     @DistProfiler.annotate(color="red")
     def rollout_session_end(self, _: DataProto):
@@ -773,7 +779,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
     @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
     @DistProfiler.annotate(color="red")
     def generate_sequences(self, prompts: DataProto):
-        ray_debug_break("generate_sequences:entry", port=5667)
+        # ray_debug_break("generate_sequences:entry", port=5667)
         # Support all hardwares
         if torch.distributed.get_rank() == 0:
             logger.info(f"{_now()} fsdp_workers generate_sequences")
@@ -794,7 +800,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
         prompts = self.rollout_sharding_manager.preprocess_data(prompts)
         ######
-        # [MemAgent] MODIFY: apply pad_to and generation_kwargs
+        # [MemAgent] MODIFY: apply `pad_to` and `generation_kwargs`
         ######
         with simple_timer("generate_sequences", timing_generate):
             output = self.rollout.generate_sequences(

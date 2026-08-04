@@ -193,7 +193,7 @@ class LLMGenerationManager:
         # OK, now we've got all we need in gen_output_list, and the final_mask indicates which one is final answer.
         assert len(sample_index) == sum(active_num_list)
         assert sum(final_mask) == len(gen_batch)
-        logger.info(f"ACTIVE_TRAJ_NUM: {active_num_list}")
+        # logger.info(f"ACTIVE_TRAJ_NUM: {active_num_list}")
         return (
             DataProto.concat(gen_output_list),
             final_mask,

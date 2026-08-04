@@ -153,8 +153,6 @@ def apply_kl_penalty(data: DataProto, kl_ctrl: core_algos.AdaptiveKLController, 
     token_level_scores = data.batch["token_level_scores"]
     batch_size = data.batch.batch_size[0]
 
-    # [MemAgent][TODO] MODIFIED: use loss_mask directly
-    # 是否直接参考memagent代码 response_mask = compute_response_mask(data)?
     if multi_turn:
         loss_mask = data.batch["loss_mask"]
         response_mask = loss_mask[:, -response_length:]
@@ -331,7 +329,7 @@ def apply_pass_reward_bonus(
     If pass_used == max_passes, bonus is 0.
     """
     coef = float(getattr(recurrent_config, "pass_reward_coef", 0.0) or 0.0)
-    if coef <= 0 or "pass_used" not in reward_batch.non_tensor_batch:
+    if "pass_used" not in reward_batch.non_tensor_batch:
         return reward_tensor, {}
 
     max_passes = int(getattr(recurrent_config, "max_passes", 0) or 0)
@@ -357,6 +355,15 @@ def apply_pass_reward_bonus(
         correct_mask = reward_tensor.sum(dim=-1) > 0
     pass_bonus = pass_bonus * correct_mask.to(pass_bonus.dtype)
 
+    metrics = {
+        "reward/pass_bonus_coef": coef,
+        "reward/pass_used_mean": pass_used.to(torch.float32).mean().item(),
+        "reward/pass_bonus_mean": pass_bonus.mean().item(),
+        "reward/pass_bonus_nonzero_frac": (pass_bonus > 0).to(torch.float32).mean().item(),
+    }
+    if coef <= 0:
+        return reward_tensor, metrics
+
     if "response_mask" in reward_batch.batch:
         response_mask = reward_batch.batch["response_mask"]
     else:
@@ -367,13 +374,6 @@ def apply_pass_reward_bonus(
     if valid.any():
         rows = torch.arange(reward_tensor.size(0), device=reward_tensor.device)[valid]
         reward_tensor[rows, last_token_idx[valid]] += pass_bonus[valid]
-
-    metrics = {
-        "reward/pass_bonus_coef": coef,
-        "reward/pass_used_mean": pass_used.to(torch.float32).mean().item(),
-        "reward/pass_bonus_mean": pass_bonus.mean().item(),
-        "reward/pass_bonus_nonzero_frac": (pass_bonus > 0).to(torch.float32).mean().item(),
-    }
     return reward_tensor, metrics
 
 class RayPPOTrainer:
@@ -1182,6 +1182,7 @@ class RayPPOTrainer:
                             # Also, just as what happened in validate, we will always set n=1 in generation_kwargs.
                             batch = batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
                             gen_batch = gen_batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
+                            loguru.logger.debug(f"[RayPPOTrainer] Rollout Start")
                             gen_batch_output, final_mask, sample_index = self.generation_manager.run_llm_loop(gen_batch, timing_raw)
                             # [MemAgent][MODIFIED] 广播 uid 用于 filter 过滤
                             gen_batch_output.non_tensor_batch['uid'] = batch.non_tensor_batch['uid'][sample_index]
@@ -1255,9 +1256,10 @@ class RayPPOTrainer:
                     batch.meta_info["global_token_num"] = torch.sum(batch.batch["attention_mask"], dim=-1).tolist()
 
                     with marked_timer("reward", timing_raw, color="yellow"):
+                        loguru.logger.debug(f"[RayPPOTrainer] Compute Reward Start")
                         # compute reward model score
                         if self.use_rm:
-                            # [MemAgent][TODO] 需要检查，qwenlong 应该是需要 use_rm
+                            # [MemAgent] 不支持添加 use_rm
                             if self.config.recurrent.enable:
                                 raise NotImplementedError("RM is not implemented for recurrent.")
                             reward_tensor = self.rm_wg.compute_rm_score(batch)
@@ -1272,6 +1274,7 @@ class RayPPOTrainer:
                             ##### make sure that samples in indexed proto are in same order as original_batch
                             reward_batch = final_batch(batch, final_mask, sample_index).union(original_batch)
                             reward_tensor, reward_extra_infos_dict = compute_reward(reward_batch, self.reward_fn)
+                            loguru.logger.debug(f"[RayPPOTrainer] `apply_pass_reward_bonus` Start")
                             reward_tensor, pass_reward_metrics = apply_pass_reward_bonus(
                                 reward_tensor=reward_tensor,
                                 reward_batch=reward_batch,
@@ -1280,8 +1283,7 @@ class RayPPOTrainer:
                             )
                             metrics.update(pass_reward_metrics)
                     
-                    # [MemAgent][TODO] 需要检查 dapo filter 逻辑，这里没有走 RayDAPOTrainer
-                    # 这里可能有 bug，如果当前 batch 全部被删掉了，后续的流程可能会出问题（比如 log_prob 计算会报错）
+                    # [MemAgent] 需要检查 dapo filter 逻辑，这里没有走 RayDAPOTrainer, 只过滤, 不重采样
                     if self.config.recurrent.enable and self.config.algorithm.get("filter_groups", None):
                         # loguru.logger.warning("filter_groups is not implemented for recurrent yet.") 
                         # NOTE: When prompts after filtering is less than train batch size,
@@ -1322,6 +1324,7 @@ class RayPPOTrainer:
                         batch, pad_size = pad_dataproto_to_divisor(batch, self.actor_rollout_wg.world_size)
                     # recompute old_log_probs
                     with marked_timer("old_log_prob", timing_raw, color="blue"):
+                        loguru.logger.debug(f"[RayPPOTrainer] Compute Old Log Prob Start")
                         old_log_prob = self.actor_rollout_wg.compute_log_prob(batch)
                         entropys = old_log_prob.batch["entropys"]
                         response_masks = batch.batch["response_mask"]
@@ -1359,6 +1362,7 @@ class RayPPOTrainer:
                     if self.use_reference_policy:
                         # compute reference log_prob
                         with marked_timer("ref", timing_raw, color="olive"):
+                            loguru.logger.debug(f"[RayPPOTrainer] Compute Ref Log Prob Start")
                             if not self.ref_in_actor:
                                 ref_log_prob = self.ref_policy_wg.compute_ref_log_prob(batch)
                             else:
@@ -1406,7 +1410,7 @@ class RayPPOTrainer:
                                 multi_turn=self.config.actor_rollout_ref.rollout.multi_turn.enable,
                                 config=self.config.algorithm,
                             )
-                            #############
+                        #############
                         else:  ###### [MemAgent] recurrent: 1D GRPO scalar advantage then broadcast to token-level by sample_index.
                             batch = unpad_dataproto(batch, pad_size)
                         
@@ -1432,9 +1436,6 @@ class RayPPOTrainer:
                             batch.batch['returns'] = advantages                             
                             # turns of a sample will have the same final reward, now we mapping turns to samples
                             batch.batch['token_level_scores'] = reward_tensor[sample_index]
-
-                            if self.config.actor_rollout_ref.actor.get('use_kl_loss', False):
-                                loguru.logger.warning("KL penalty is not implemented for recurrent?")
                             
                             batch.batch['token_level_rewards'] = batch.batch['token_level_scores']
 
@@ -1467,6 +1468,7 @@ class RayPPOTrainer:
                                 batch.batch['no_padding_mask'] = torch.ones(len(batch), dtype=torch.bool)
                         # update actor
                         with marked_timer("update_actor", timing_raw, color="red"):
+                            loguru.logger.debug(f"[RayPPOTrainer] Compute Update Actor Start")
                             batch.meta_info["multi_turn"] = self.config.actor_rollout_ref.rollout.multi_turn.enable
                             actor_output = self.actor_rollout_wg.update_actor(batch)
                         actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
@@ -1478,7 +1480,7 @@ class RayPPOTrainer:
 
                     # Log rollout generations if enabled
                     rollout_data_dir = self.config.trainer.get("rollout_data_dir", None)
-                    if rollout_data_dir:
+                    if rollout_data_dir and self.global_steps in [1, 2, 5, 10, 20, 30, 40, 60, 80, 100, 140, 240]:
                         with marked_timer("dump_rollout_generations", timing_raw, color="green"):
                             from recurrent.utils import clip_long_string
                             loguru.logger.info(f"[Before Dump] Batch keys: {batch.batch.keys()}")
