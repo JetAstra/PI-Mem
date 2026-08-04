@@ -13,6 +13,8 @@
 # limitations under the License.
 import asyncio
 import logging
+import os
+import time
 from typing import Tuple, Type
 
 import numpy as np
@@ -73,26 +75,118 @@ class AsyncLLMGenerationManager:
         self, gen_batch: DataProto, timing_raw
     ) -> Tuple[DataProto, torch.BoolTensor, torch.LongTensor]:
         """Run memagent's async serial memory rollout loop."""
+        log_interval = float(os.environ.get("MEMAGENT_ROLLOUT_LOG_INTERVAL", "60"))
+        rollout_start = time.monotonic()
         with _timer("mt_engine", timing_raw):
             self.agent.start(gen_batch, timing_raw)
             gen_batch.batch["sample_index"] = torch.arange(
                 len(gen_batch), dtype=torch.long
             )
+            context_lengths = gen_batch.batch.get("context_length", None)
+            if context_lengths is not None:
+                context_lengths = context_lengths.detach().cpu()
+                logger.info(
+                    "[MemAgent][rollout] start batch_size=%d context_len(min/mean/max)=%d/%.1f/%d "
+                    "chunk_size=%s max_chunks=%s max_mem_tokens=%s max_final_tokens=%s",
+                    len(gen_batch),
+                    int(context_lengths.min().item()),
+                    float(context_lengths.float().mean().item()),
+                    int(context_lengths.max().item()),
+                    getattr(self.config, "chunk_size", None),
+                    getattr(self.config, "max_chunks", None),
+                    getattr(self.config, "max_memorization_length", None),
+                    getattr(self.config, "max_final_response_length", None),
+                )
+            else:
+                logger.info("[MemAgent][rollout] start batch_size=%d", len(gen_batch))
 
         async def rollout_coro():
-            async def rollout(b):
-                async_output = await self.agent.rollout(b)
-                with _timer("mt_output", async_output.timing_raw):
-                    extra_batch = async_output.batch
-                    batch = self.tokenize_output(async_output)
-                    batch.update(extra_batch)
-                    async_output.batch = batch
-                return async_output
+            heartbeat_task = None
+            progress = {"started": 0, "finished": 0, "failed": 0}
 
-            return await asyncio.gather(*[rollout(b) for b in gen_batch])
+            async def heartbeat():
+                while True:
+                    await asyncio.sleep(log_interval)
+                    snapshot = getattr(self.agent, "_debug_progress", {})
+                    pending = {
+                        k: v for k, v in snapshot.items()
+                        if v.get("phase") not in ("done", "failed")
+                    }
+                    oldest_items = sorted(
+                        pending.items(),
+                        key=lambda item: item[1].get("updated_at", rollout_start),
+                    )[:8]
+                    oldest_desc = [
+                        "sample=%s phase=%s step=%s age=%.1fs prompt_chars=%s request_id=%s"
+                        % (
+                            sample_idx,
+                            state.get("phase"),
+                            state.get("step"),
+                            time.monotonic() - state.get("updated_at", rollout_start),
+                            state.get("prompt_chars"),
+                            state.get("request_id"),
+                        )
+                        for sample_idx, state in oldest_items
+                    ]
+                    logger.info(
+                        "[MemAgent][rollout] heartbeat elapsed=%.1fs started=%d finished=%d failed=%d "
+                        "pending=%d oldest_pending=%s",
+                        time.monotonic() - rollout_start,
+                        progress["started"],
+                        progress["finished"],
+                        progress["failed"],
+                        len(pending),
+                        oldest_desc,
+                    )
+
+            async def rollout(b):
+                sample_index = b.batch["sample_index"].item()
+                progress["started"] += 1
+                sample_start = time.monotonic()
+                try:
+                    async_output = await self.agent.rollout(b)
+                    with _timer("mt_output", async_output.timing_raw):
+                        extra_batch = async_output.batch
+                        batch = self.tokenize_output(async_output)
+                        batch.update(extra_batch)
+                        async_output.batch = batch
+                    progress["finished"] += 1
+                    if sample_index < 8 or sample_index % 128 == 0:
+                        logger.info(
+                            "[MemAgent][rollout] sample done sample=%d turns=%d elapsed=%.1fs",
+                            sample_index,
+                            len(async_output.conversations),
+                            time.monotonic() - sample_start,
+                        )
+                    return async_output
+                except Exception:
+                    progress["failed"] += 1
+                    logger.exception(
+                        "[MemAgent][rollout] sample failed sample=%d elapsed=%.1fs",
+                        sample_index,
+                        time.monotonic() - sample_start,
+                    )
+                    raise
+
+            if log_interval > 0:
+                heartbeat_task = asyncio.create_task(heartbeat())
+            try:
+                return await asyncio.gather(*[rollout(b) for b in gen_batch])
+            finally:
+                if heartbeat_task is not None:
+                    heartbeat_task.cancel()
+                    try:
+                        await heartbeat_task
+                    except asyncio.CancelledError:
+                        pass
 
         gen_output_list = run_coroutine(rollout_coro())
         with _timer("mt_gather", timing_raw):
+            logger.info(
+                "[MemAgent][rollout] gather start outputs=%d elapsed=%.1fs",
+                len(gen_output_list),
+                time.monotonic() - rollout_start,
+            )
             gen_output = self.concat_output(
                 [o.batch for o in gen_output_list],
                 [o.non_tensor_batch for o in gen_output_list],
@@ -100,6 +194,15 @@ class AsyncLLMGenerationManager:
             sample_index = torch.cat([o.sample_index for o in gen_output_list])
             final_mask = torch.cat([o.final_mask for o in gen_output_list])
             assert sum(final_mask) == len(gen_batch)
+            logger.info(
+                "[MemAgent][rollout] gather done rows=%d final_rows=%d sample_index_rows=%d "
+                "response_shape=%s elapsed=%.1fs",
+                len(gen_output),
+                int(final_mask.sum().item()),
+                int(sample_index.numel()),
+                tuple(gen_output.batch["responses"].shape),
+                time.monotonic() - rollout_start,
+            )
             timing_raw.update(
                 self.agent.reduce_timings([g.timing_raw for g in gen_output_list])
             )

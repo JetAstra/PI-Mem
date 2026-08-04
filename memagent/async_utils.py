@@ -12,9 +12,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import asyncio
+import logging
+import os
+import time
 from types import SimpleNamespace
 from typing import Any, Optional, Tuple
 from uuid import uuid4
+
+logger = logging.getLogger(__file__)
+logger.setLevel("INFO")
 
 
 class ChatCompletionProxy:
@@ -45,6 +51,7 @@ class ChatCompletionProxy:
         existing memagent agents: choices[0].message, finish_reason, stop_reason.
         """
         completions, exception = None, None
+        start_time = time.monotonic()
         try:
             extra_headers = chat_complete_request.pop("extra_headers", {}) or {}
             request_id = extra_headers.get("x-request-id", None)
@@ -52,6 +59,13 @@ class ChatCompletionProxy:
                 request_id = request_id[len("chatcmpl-") :]
             if not request_id:
                 request_id = uuid4().hex
+            should_log = os.environ.get("MEMAGENT_LOG_ALL_REQUESTS", "0") == "1"
+            if request_id.startswith("memagent-s"):
+                try:
+                    sample_idx = int(request_id.split("-", 2)[1][1:])
+                    should_log = should_log or sample_idx < 8 or sample_idx % 128 == 0
+                except Exception:
+                    should_log = True
 
             messages = chat_complete_request.pop("messages")
             prompt_ids = self.tokenizer.apply_chat_template(
@@ -80,11 +94,29 @@ class ChatCompletionProxy:
             if n != 1:
                 raise NotImplementedError("n > 1 is not supported by memagent ChatCompletionProxy")
 
+            if should_log:
+                logger.info(
+                    "[MemAgent][proxy] generate start request_id=%s prompt_tokens=%d max_tokens=%s "
+                    "temperature=%s top_p=%s",
+                    request_id,
+                    len(prompt_ids),
+                    sampling_params.get("max_tokens", sampling_params.get("max_new_tokens")),
+                    sampling_params.get("temperature"),
+                    sampling_params.get("top_p"),
+                )
             output = await self.llm_client.generate(
                 request_id=request_id,
                 prompt_ids=prompt_ids,
                 sampling_params=sampling_params,
             )
+            if should_log:
+                logger.info(
+                    "[MemAgent][proxy] generate done request_id=%s output_tokens=%d stop_reason=%s elapsed=%.1fs",
+                    request_id,
+                    len(output.token_ids),
+                    output.stop_reason,
+                    time.monotonic() - start_time,
+                )
             content = self.tokenizer.decode(output.token_ids, skip_special_tokens=True)
             finish_reason = "stop" if output.stop_reason == "completed" else output.stop_reason
             choice = SimpleNamespace(
@@ -100,6 +132,11 @@ class ChatCompletionProxy:
         except Exception as e:
             # Let user handle the exception
             exception = e
+            logger.exception(
+                "[MemAgent][proxy] generate failed request_id=%s elapsed=%.1fs",
+                locals().get("request_id", None),
+                time.monotonic() - start_time,
+            )
 
         return completions, exception
 
