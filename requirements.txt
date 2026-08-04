@@ -81,7 +81,7 @@ GitPython==3.1.50
 google-api-core==2.30.3
 google-auth==2.52.0
 googleapis-common-protos==1.74.0
-grpcio==1.80.0
+grpcio==1.83.0
 grpcio-reflection==1.80.0
 h11==0.16.0
 hf-xet==1.5.0
