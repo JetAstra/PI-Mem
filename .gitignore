@@ -126,3 +126,10 @@ outputs
 .history
 
 recurrent_origin/
+models/
+hotpotqa/
+
+# Local workspace instructions and scratch files
+/AGENTS.md
+/vllm_serve.md
+/test.ipynb
