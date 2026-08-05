@@ -9,9 +9,9 @@ cd /mnt/shared-storage-user/liudawei/home/verl/
 echo "$(which python)"
 
 export LLM_JUDGE=N
-export VERIFIER_PATH=/mnt/shared-storage-user/dllm-share/Models/Qwen2_2.5/Qwen2.5-32B-Instruct/
-export VERIFIER_HOST=100.97.88.167
-export VERIFIER_PORT=23547
+# export VERIFIER_PATH=/mnt/shared-storage-user/dllm-share/Models/Qwen2_2.5/Qwen2.5-32B-Instruct/
+# export VERIFIER_HOST=100.97.88.167
+# export VERIFIER_PORT=23547
 
 export VERL_LOGGING_LEVEL=DEBUG
 
@@ -120,7 +120,8 @@ if (( NODE_RANK == 0 )); then
 fi
 
 # export HYDRA_FULL_ERROR=1
-# recurrent.memory.config.max_prompt_length 只有一小段 query 长度
+# recurrent.memory.config.max_prompt_length represents the length of a small query segment.
+# For the earlier version of verl, we must need to specify `save_contents` for here.
 if (( NODE_RANK == 0 )); then
     python3 -u -m verl.trainer.main_ppo \
         recurrent.enable=memory \
@@ -186,7 +187,7 @@ if (( NODE_RANK == 0 )); then
         trainer.n_gpus_per_node=$NGPUS_PER_NODE \
         trainer.nnodes=$NNODES \
         trainer.test_freq=-1 \
-        trainer.save_freq=10 \
+        trainer.save_freq=20 \
         trainer.default_hdfs_dir=null \
         trainer.rollout_data_dir=${PROJ_ROOT}/${EXPERIMENT_NAME}/rollout \
         trainer.default_local_dir=${PROJ_ROOT}/${EXPERIMENT_NAME}/ckpt \
