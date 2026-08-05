@@ -89,9 +89,6 @@ def get_pred(data, args, out_file):
     elif args.api == "rag":
         from utils import extract_answer
         from utils.openai_retrieval import async_query_llm
-    elif args.api == "infmem":
-        from utils import extract_answer
-        from utils.infmem import async_query_llm_multi_turn as async_query_llm
     elif args.api == "recurrent":
         from utils import extract_answer
         from utils.recurrent import async_query_llm
