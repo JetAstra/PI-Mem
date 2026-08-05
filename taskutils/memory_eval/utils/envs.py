@@ -1,4 +1,5 @@
 import os
+from pathlib import Path
 
 
 def _str_to_bool(value, default=False):
@@ -14,11 +15,11 @@ def _str_to_bool(value, default=False):
 
 DATAROOT = os.getenv(
     "DATAROOT",
-    "/mnt/shared-storage-user/liudawei/home/verl-new/hotpotqa",
+    "hf://datasets/JetLM/PI-Mem-Data/hotpotqa_eval",
 )
 MEMORY_DATA_ROOT = os.getenv(
     "MEMORY_DATA_ROOT",
-    "/mnt/shared-storage-user/liudawei/home/verl-new/taskutils/memory_data",
+    str(Path(__file__).resolve().parents[2] / "memory_data"),
 )
 MAX_INPUT_LEN = int(os.getenv("MAX_INPUT_LEN", "120000"))
 MAX_OUTPUT_LEN = int(os.getenv("MAX_OUTPUT_LEN", "10000"))
