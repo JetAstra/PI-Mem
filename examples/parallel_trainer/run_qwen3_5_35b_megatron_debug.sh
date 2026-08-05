@@ -35,24 +35,31 @@ cd /mnt/shared-storage-user/liudawei/home/verl-new/
 source /mnt/shared-storage-user/liudawei/miniforge3/etc/profile.d/conda.sh
 conda activate /mnt/shared-storage-user/liudawei/envs/verl-071
 
+ray stop -f
+
 export CUDA_DEVICE_MAX_CONNECTIONS=1
 export VLLM_USE_V1=1
 export VLLM_ALLREDUCE_USE_SYMM_MEM=0
+
+export NNODES=4
+
 export WANDB_MODE=offline
+export TORCH_MULTIPROCESSING_SHARING_STRATEGY=file_system
+export PYTHONHASHSEED=0
+export TRANSFORMERS_OFFLINE=1
+export HF_DATASETS_OFFLINE=1
+export HF_HUB_OFFLINE=1
+export PYTHONUNBUFFERED=1
+export VERL_LOGGING_LEVEL=DEBUG
 
-export HOME=/mnt/shared-storage-user/liudawei/home/
-export HF_HOME=/mnt/shared-storage-user/liudawei/home/.cache/huggingface/
-export HF_DATASETS_CACHE=/mnt/shared-storage-user/liudawei/.cache/huggingface/datasets
-
-export VLLM_RPC_TIMEOUT=1200
-export VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS=600
-export VLLM_ENGINE_ITERATION_TIMEOUT_S=120
+export VLLM_RPC_TIMEOUT=320000
+export VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS=36000
+export VLLM_ENGINE_ITERATION_TIMEOUT_S=16000
 
 #### for debug?
 # dont use export PYTORCH_ALLOC_CONF=expandable_segments:True!!
 export HYDRA_FULL_ERROR=1
-# export CUDA_VISIBLE_DEVICES="4,5,6,7"
-# set -xeuo pipefail
+
 
 ########################### Quick Config ###########################
 
@@ -60,9 +67,9 @@ export HYDRA_FULL_ERROR=1
 TP=${TP:-2}
 PP=${PP:-1}
 CP=${CP:-1}
-EP=${EP:-4}
+EP=${EP:-8}
 ETP=${ETP:-1}
-GEN_TP=${GEN_TP:-4}
+GEN_TP=${GEN_TP:-2}
 SP=${SP:-True}
 
 REF_OFFLOAD=${REF_OFFLOAD:-True}
@@ -70,11 +77,10 @@ OLD_MICRO_BSZ=${OLD_MICRO_BSZ:-2}
 
 rollout_name="vllm"
 project_name='ParallelAgent'
-exp_name='interns2_megatron_debug'
+exp_name='Qwen3_5-35B-A3B-megatron'
 adv_estimator=grpo
 
-# HF_MODEL_PATH=${HF_MODEL_PATH:-"/mnt/shared-storage-gpfs2/gpfs2-shared-public/huggingface/hub/models--Qwen--Qwen3.5-35B-A3B/snapshots/ec2d4ece1ffb563322cbee9a48fe0e3fcbce0307"}
-HF_MODEL_PATH=${HF_MODEL_PATH:-"/mnt/shared-storage-user/liudawei/home/verl/models/Intern-S2-preview-Qwen3.5"}
+HF_MODEL_PATH=${HF_MODEL_PATH:-"/mnt/shared-storage-gpfs2/gpfs2-shared-public/huggingface/hub/models--Qwen--Qwen3.5-35B-A3B/snapshots/ec2d4ece1ffb563322cbee9a48fe0e3fcbce0307"}
 # train_path=${train_path:-"data/hotpotqa/hotpotqa_train_32k.parquet"}
 train_path=/mnt/shared-storage-user/liudawei/home/verl/data/hotpotqa_train_sample/hotpotqa_train_doc1000.parquet
 test_path=${test_path:-"data/hotpotqa/hotpotqa_dev.parquet"}
@@ -89,7 +95,7 @@ resp_len=${resp_len:-4096}
 DATA=(
     data.train_files=${train_path}
     data.val_files=${test_path}
-    data.train_batch_size=4
+    data.train_batch_size=128
     data.max_prompt_length=140000
     data.max_response_length=${resp_len}
     data.truncation='middle'
@@ -108,6 +114,7 @@ RECURRENT=(
     recurrent.memory.config.max_memorization_length=${resp_len}
     recurrent.memory.config.max_final_response_length=${resp_len}
     recurrent.memory.config.pass_reward_coef=0.2
+    recurrent.memory.config.chunk_parallelism_per_sample=3
 )
 
 MODEL=(
@@ -116,18 +123,21 @@ MODEL=(
     actor_rollout_ref.model.use_remove_padding=False
 )
 
+# We don't need to specify `save_contents` here
 ACTOR=(
     actor_rollout_ref.actor.optim.lr_warmup_steps=20
     actor_rollout_ref.actor.optim.lr=1e-6
     actor_rollout_ref.actor.optim.use_checkpoint_opt_param_scheduler=True
     actor_rollout_ref.actor.clip_ratio_high=0.20
-    actor_rollout_ref.actor.ppo_mini_batch_size=2
+    actor_rollout_ref.actor.ppo_mini_batch_size=8
     actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=2
     actor_rollout_ref.actor.use_dynamic_bsz=False
-    actor_rollout_ref.actor.use_kl_loss=False
+    actor_rollout_ref.actor.use_kl_loss=True
     actor_rollout_ref.actor.kl_loss_coef=0.001
     actor_rollout_ref.actor.kl_loss_type=low_var_kl
     actor_rollout_ref.actor.entropy_coeff=0
+    # actor_rollout_ref.actor.checkpoint.load_contents='["model", "optimizer", "extra"]'
+    # actor_rollout_ref.actor.checkpoint.save_contents='["model", "optimizer", "extra"]'
     actor_rollout_ref.actor.megatron.use_mbridge=True
     actor_rollout_ref.actor.megatron.vanilla_mbridge=True
     actor_rollout_ref.actor.megatron.use_remove_padding=False
@@ -158,7 +168,7 @@ ROLLOUT=(
     actor_rollout_ref.rollout.temperature=1
     actor_rollout_ref.rollout.top_p=1.0
     actor_rollout_ref.rollout.tensor_model_parallel_size=${GEN_TP}
-    actor_rollout_ref.rollout.gpu_memory_utilization=0.5
+    actor_rollout_ref.rollout.gpu_memory_utilization=0.6
     actor_rollout_ref.rollout.val_kwargs.do_sample=True
     actor_rollout_ref.rollout.val_kwargs.temperature=1.0
     actor_rollout_ref.rollout.val_kwargs.top_p=0.7
@@ -191,16 +201,16 @@ ALGORITHM=(
 
 TRAINER=(
     trainer.critic_warmup=0
-    trainer.logger='["console"]'
+    trainer.logger='["console","wandb"]'
     trainer.project_name=${project_name}
     trainer.experiment_name=${exp_name}
     trainer.rollout_data_dir=${CKPTS_DIR}/dump
-    trainer.n_gpus_per_node=4
-    trainer.nnodes=1
+    trainer.n_gpus_per_node=8
+    trainer.nnodes=${NNODES}
     trainer.save_freq=20
     trainer.val_before_train=False
     trainer.test_freq=-1
-    trainer.total_epochs=15
+    trainer.total_epochs=10
 )
 
 EXTRA=(
@@ -209,7 +219,7 @@ EXTRA=(
 
 ########################### Launch ###########################
 
-python3 -u -m verl.trainer.main_ppo_debug \
+python3 -u -m verl.trainer.main_ppo \
     "${DATA[@]}" \
     "${RECURRENT[@]}" \
     "${ALGORITHM[@]}" \
@@ -221,5 +231,3 @@ python3 -u -m verl.trainer.main_ppo_debug \
     "${EXTRA[@]}" \
     "$@" 2>&1 | tee ${CKPTS_DIR}/training-$(date +%Y%m%d)_$(date +%H%M%S).log
 
-
-# bash /mnt/shared-storage-user/liudawei/home/LLaMA-Factory/examples/shell/lmf-qwen3-dense-ar-rlaunch8.sh

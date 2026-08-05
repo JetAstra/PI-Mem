@@ -61,8 +61,6 @@ export VLLM_ENGINE_ITERATION_TIMEOUT_S=16000
 # dont use export PYTORCH_ALLOC_CONF=expandable_segments:True!!
 export HYDRA_FULL_ERROR=1
 
-# set -xeuo pipefail
-
 
 ########################### Quick Config ###########################
 
@@ -126,6 +124,7 @@ MODEL=(
     actor_rollout_ref.model.use_remove_padding=False
 )
 
+# We don't need to specify `save_contents` here
 ACTOR=(
     actor_rollout_ref.actor.optim.lr_warmup_steps=20
     actor_rollout_ref.actor.optim.lr=1e-6
@@ -209,7 +208,7 @@ TRAINER=(
     trainer.rollout_data_dir=${CKPTS_DIR}/dump
     trainer.n_gpus_per_node=8
     trainer.nnodes=${NNODES}
-    trainer.save_freq=2
+    trainer.save_freq=20
     trainer.val_before_train=False
     trainer.test_freq=-1
     trainer.total_epochs=10
