@@ -191,16 +191,13 @@ if __name__ == "__main__":
     pd.set_option('display.width', 150) 
     pd.set_option('display.colheader_justify', 'left')
 
-    # basedir = "taskutils/memory_eval/results_qwen3.5-35B-parallel-boxed/step_80"
-    # basedir = "taskutils/memory_eval/results_qwen2.5-7B-parallel-boxed/step_240"
-    basedir = "taskutils/memory_eval/results_qwen3.5-35B-parallel-training-free-ablate/control"
-    # basedir = "taskutils/memory_eval/results-qwen3.5-openai-repeat/qwen3.5-openai/repeat_runs/run11"
+    base_dir = "<relative path>"
     # relpath = ['ruler_hqa*', '*.jsonl']
     relpath = ['ruler*', '*.jsonl']
 
-    full_results_df = collect_and_transform_data(basedir, relpath)
+    full_results_df = collect_and_transform_data(base_dir, relpath)
     # 将full_results_df保存为CSV文件
-    output_csv_path = os.path.join(basedir, "aggregated_results.csv")
+    output_csv_path = os.path.join(base_dir, "aggregated_results.csv")
     full_results_df.to_csv(output_csv_path)
     print("--- Result ---")
     print(full_results_df)

@@ -137,12 +137,7 @@ if __name__ == "__main__":
     )
     args = parser.parse_args()
 
-    # base_dir = "taskutils/memory_eval/results_qwen3.5-35B-parallel-boxed/qwen3.5-35B-baseline-boxed"
-    # base_dir = "taskutils/memory_eval/results_qwen3.5-35B-parallel-boxed/step_26"
-    # base_dir = "taskutils/memory_eval/results_qwen3.5-35B-v2-parallel-boxed/qwen3.5-35B-baseline-boxed"
-    # base_dir = "taskutils/memory_eval/results_qwen3.5-35B-v2-parallel-boxed/step_46"
-    # base_dir = "taskutils/memory_eval/results_qwen3.5-35B-v2-parallel-boxed-v4-seed424242/step_80"
-    base_dir = "taskutils/memory_eval/results_qwen2.5-7B-ablate/parallel-max-passes-1-step_240"
+    base_dir = "<relative path>"
     relpath = ["ruler*", "*.jsonl"]
 
     df = collect_stats(base_dir, relpath, on_missing=args.on_missing)
