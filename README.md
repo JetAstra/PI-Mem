@@ -6,7 +6,7 @@
   <a href="https://huggingface.co/collections/JetLM/pi-mem"><img alt="Models" src="https://img.shields.io/badge/Models-dea60b?style=for-the-badge&logo=huggingface&logoColor=white"></a>
   <a href="https://huggingface.co/datasets/JetLM/PI-Mem-Data"><img alt="Datasets" src="https://img.shields.io/badge/Datasets-dea60b?style=for-the-badge&logo=huggingface&logoColor=white"></a>
   <a href="https://github.com/JetAstra/PI-Mem"><img alt="GitHub" src="https://img.shields.io/badge/GitHub-24292F?style=for-the-badge&logo=github&logoColor=white"></a>
-  <img alt="Paper" src="https://img.shields.io/badge/Paper-D14D4D?style=for-the-badge&logo=arxiv&logoColor=white">
+  <a href="https://arxiv.org/abs/2608.03048"><img alt="Paper" src="https://img.shields.io/badge/Paper-D14D4D?style=for-the-badge&logo=arxiv&logoColor=white"></a>
 </p>
 
 </div>
