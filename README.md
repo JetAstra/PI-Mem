@@ -3,13 +3,15 @@
 # PI-Mem: Pushing Long-Context Reasoning to 3.6M Tokens with Parallel-Iterative Memory
 
 <p>
-  <a href="https://huggingface.co/collections/JetLM/pi-mem"><img alt="Models" src="https://img.shields.io/badge/Models-FFD21E?style=for-the-badge&logo=huggingface&logoColor=000000"></a>
-  <a href="https://huggingface.co/datasets/JetLM/PI-Mem-Data"><img alt="Datasets" src="https://img.shields.io/badge/Datasets-FFD21E?style=for-the-badge&logo=huggingface&logoColor=000000"></a>
+  <a href="https://huggingface.co/collections/JetLM/pi-mem"><img alt="Models" src="https://img.shields.io/badge/Models-dea60b?style=for-the-badge&logo=huggingface&logoColor=white"></a>
+  <a href="https://huggingface.co/datasets/JetLM/PI-Mem-Data"><img alt="Datasets" src="https://img.shields.io/badge/Datasets-dea60b?style=for-the-badge&logo=huggingface&logoColor=white"></a>
   <a href="https://github.com/JetAstra/PI-Mem"><img alt="GitHub" src="https://img.shields.io/badge/GitHub-24292F?style=for-the-badge&logo=github&logoColor=white"></a>
-  <img alt="Paper" src="https://img.shields.io/badge/Paper-D14D4D?style=for-the-badge&logo=arxiv&logoColor=white">
+  <a href="https://arxiv.org/abs/2608.03048"><img alt="Paper" src="https://img.shields.io/badge/Paper-D14D4D?style=for-the-badge&logo=arxiv&logoColor=white"></a>
 </p>
 
 </div>
+
+---
 
 <p align="center">
   <img src="./assets/teaser.png" width="80%" alt="Comparison between recurrent memory and PI-Mem">
@@ -52,6 +54,12 @@ This repository is built on top of [verl](https://github.com/verl-project/verl) 
 
 ```bibtex
 @misc{liu2026pimem,
-  
+  title={PI-Mem: Pushing Long-Context Reasoning to 3.6M Tokens with Parallel-Iterative Memory},
+  author={Dawei Liu and Haixu Song and Shuang Cheng and Shijie Wang and Haozheng Hou and Kaifeng Liu and Ermo Hua and Zhonghang Yuan and Zhijie Zhong and Yuchen Fan and Biqing Qi and Bowen Zhou},
+  year={2026},
+  eprint={2608.03048},
+  archivePrefix={arXiv},
+  primaryClass={cs.CL},
+  url={https://arxiv.org/abs/2608.03048}
 }
 ```
