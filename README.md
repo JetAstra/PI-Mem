@@ -14,11 +14,11 @@
 ---
 
 <p align="center">
-  <img src="./assets/teaser.png" width="80%" alt="Comparison between recurrent memory and PI-Mem">
+  <img src="./assets/teaser.png" width="60%" alt="Comparison between recurrent memory and PI-Mem">
 </p>
 
 <p align="center"><em>
-Recurrent memory processes chunks sequentially and may overwrite early evidence with later noise. PI-Mem reads chunks in parallel against a shared memory, preserving relevant evidence while shortening the serial inference path.
+Recurrent memory processes chunks sequentially and may overwrite early evidence with later noise. PI-Mem reads chunks in parallel conditioned on a shared global memory, improving evidence preservation and reducing inference latency.
 </em></p>
 
 ## Overview
@@ -70,25 +70,167 @@ pip install -e . --no-deps
 
 ## Evaluation
 
-Run evaluations from the repository root using the corresponding launcher:
+### Step 1: Prepare the evaluation data
 
-| Benchmark         | Launch script                                                                                                    |
-| ----------------- | ---------------------------------------------------------------------------------------------------------------- |
-| RULER HQA and OOD | [Qwen3.5-35B-A3B](./taskutils/memory_eval/eval_qwen35.sh) · [Qwen2.5-7B](./taskutils/memory_eval/eval_qwen25.sh) |
-| LongBench v2      | [Qwen3.5-35B-A3B](./taskutils/LongBench/eval_longbench.sh)                                                       |
+RULER HQA and OOD data are released in [`hotpotqa_eval/`](https://huggingface.co/datasets/JetLM/PI-Mem-Data/tree/main/hotpotqa_eval). Choose either remote or local loading:
 
-The RULER launchers expose the configurations, task subsets, and context lengths at the top of each script, so they can be adjusted without changing the Python entry points.
+- **Remote loading:** no preparation is required. The RULER launchers default to `hf://datasets/JetLM/PI-Mem-Data/hotpotqa_eval`.
+- **Local loading:** download the directory without flattening it, then point `DATA_ROOT` to it:
 
-Evaluation data are available under [`hotpotqa_eval/`](https://huggingface.co/datasets/JetLM/PI-Mem-Data/tree/main/hotpotqa_eval) in `JetLM/PI-Mem-Data`. The same repository provides reference traces for [`PI-Mem-35B-A3B`](https://huggingface.co/datasets/JetLM/PI-Mem-Data/tree/main/PI-Mem-35B-A3B-trace) and [`PI-Mem-7B`](https://huggingface.co/datasets/JetLM/PI-Mem-Data/tree/main/PI-Mem-7B-trace). After evaluation, set `base_dir` in [`taskutils/memory_eval/visualize.py`](./taskutils/memory_eval/visualize.py) to the result directory and run it to generate `aggregated_results.csv`, including averages grouped by context length.
+```bash
+mkdir -p data/PI-Mem-Data
+hf download JetLM/PI-Mem-Data \
+  --repo-type dataset \
+  --include "hotpotqa_eval/*" \
+  --local-dir data/PI-Mem-Data
+
+export DATA_ROOT="$PWD/data/PI-Mem-Data/hotpotqa_eval"
+```
+
+LongBench v2 expects `taskutils/LongBench/data/data.json`. Prepare it with:
+
+```bash
+mkdir -p taskutils/LongBench/data
+hf download THUDM/LongBench-v2 data.json \
+  --repo-type dataset \
+  --local-dir taskutils/LongBench/data
+```
+
+For comparison and debugging, the data repository also contains the released traces for [`PI-Mem-35B-A3B`](https://huggingface.co/datasets/JetLM/PI-Mem-Data/tree/main/PI-Mem-35B-A3B-trace) and [`PI-Mem-7B`](https://huggingface.co/datasets/JetLM/PI-Mem-Data/tree/main/PI-Mem-7B-trace).
+
+### Step 2: Select a configuration and model
+
+`pi-mem-trained` is the default. It resolves to `JetLM/PI-Mem-35B-A3B` for Qwen3.5 and `JetLM/PI-Mem-7B` for Qwen2.5. Override the model variables when using local checkpoints:
+
+```bash
+export QWEN35_PI_MEM_MODEL=/path/to/PI-Mem-35B-A3B
+export QWEN25_PI_MEM_MODEL=/path/to/PI-Mem-7B
+```
+
+To inspect every resolved model path before launching a server:
+
+```bash
+bash taskutils/memory_eval/eval_qwen35.sh --list-configs
+bash taskutils/memory_eval/eval_qwen25.sh --list-configs
+```
+
+### Step 3: Run a small RULER check
+
+Start with one configuration, one length, and a limited number of samples.
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
+CONFIGS=pi-mem-trained \
+TASKS=hqa \
+HQA_LENGTHS=800 \
+RESULTS_DIR="$PWD/outputs/eval/qwen35-smoke" \
+bash taskutils/memory_eval/eval_qwen35.sh --num-samples 64
+```
+
+Use `eval_qwen25.sh` for PI-Mem-7B.
+
+`CONFIGS`, `TASKS`, task names, and lengths are comma-separated, and their order is the execution order. The launchers default to the complete HQA/OOD suite.
+
+### Step 4: Run LongBench v2
+
+```bash
+CONFIGS=pi-mem-trained \
+SAVE_DIR="$PWD/outputs/eval/longbench-qwen35" \
+bash taskutils/LongBench/eval_longbench.sh
+```
+
+### Step 5: Aggregate and inspect RULER results
+
+RULER outputs follow this layout:
+
+```text
+outputs/eval/qwen35-smoke/
+├── logs/
+├── ruler_hqa_800/
+│   └── pi-mem-trained.jsonl
+└── ...
+```
+
+Set `base_dir` near the bottom of [`taskutils/memory_eval/visualize.py`](./taskutils/memory_eval/visualize.py) to the result directory:
+
+```python
+base_dir = "outputs/eval/qwen35-smoke"
+```
+
+Then run:
+
+```bash
+python taskutils/memory_eval/visualize.py
+```
 
 ## Training
 
-The [`main`](https://github.com/JetAstra/PI-Mem/tree/main) branch contains the Qwen3.5 training implementation. PI-Mem-7B was trained with an earlier verl codebase; use the dedicated [`qwen2.5`](https://github.com/JetAstra/PI-Mem/tree/qwen2.5) branch to reproduce that experiment.
+The [`main`](https://github.com/JetAstra/PI-Mem/tree/main) branch contains the Qwen3.5 training implementation. PI-Mem-7B was trained with an earlier verl codebase and should be reproduced from the dedicated [`qwen2.5`](https://github.com/JetAstra/PI-Mem/tree/qwen2.5) branch.
 
-For Qwen3.5, download [`hotpotqa_train/hotpotqa_train_doc1000.parquet`](https://huggingface.co/datasets/JetLM/PI-Mem-Data/blob/main/hotpotqa_train/hotpotqa_train_doc1000.parquet) from `JetLM/PI-Mem-Data`, then update the model, data, environment, and checkpoint paths in [`examples/parallel_trainer/run_qwen3_5_35b_megatron_debug.sh`](./examples/parallel_trainer/run_qwen3_5_35b_megatron_debug.sh). The released PI-Mem-35B-A3B checkpoint was trained for **80 rollout steps**; `trainer.total_epochs` in the example script is only a placeholder and does not represent the reported training duration.
+### Step 1: Select the training branch
+
+For PI-Mem-35B-A3B:
+
+```bash
+git switch main
+```
+
+For PI-Mem-7B, switch branches and follow the training instructions in that branch:
+
+```bash
+git switch qwen2.5
+```
+
+The remaining steps describe Qwen3.5 training on `main`.
+
+### Step 2: Download the prepared training data
+
+The released Qwen3.5 training set is a ready-to-use parquet file containing the long context and question fields required by the trainer. It is approximately 9.7 GB and does not need another preprocessing pass.
+
+```bash
+mkdir -p data/PI-Mem-Data data/hotpotqa
+
+# For Qwen3.5 training
+hf download JetLM/PI-Mem-Data \
+  hotpotqa_train/hotpotqa_train_doc1000.parquet \
+  --repo-type dataset \
+  --local-dir data/PI-Mem-Data
+
+# For Qwen2.5 training
+hf download BytedTsinghua-SIA/hotpotqa \
+  hotpotqa_dev.parquet \
+  --repo-type dataset \
+  --local-dir data/hotpotqa
+```
+
+### Step 3: Configure the training launcher
+
+Open [`examples/parallel_trainer/run_qwen3_5_35b_megatron_debug.sh`](./examples/parallel_trainer/run_qwen3_5_35b_megatron_debug.sh) and update the machine-specific setup at the top of the file:
+
+1. Replace the hard-coded repository path in `cd` with your clone.
+2. Replace the Conda initialization and environment paths.
+3. Set `NNODES` to the number of training nodes; the script uses eight GPUs per node.
+4. In the **Quick Config** block, set these paths:
+
+```bash
+HF_MODEL_PATH=/path/to/PI-Mem/models/Qwen3.5-35B-A3B
+train_path=/path/to/PI-Mem/data/PI-Mem-Data/hotpotqa_train/hotpotqa_train_doc1000.parquet
+CKPTS_DIR=/path/to/output/checkpoints
+```
+
+### Step 4: Launch and monitor training
+
+Run the launcher after the model, data, checkpoint directory, and requested compute allocation are available:
+
+```bash
+bash examples/parallel_trainer/run_qwen3_5_35b_megatron_debug.sh
+```
+
+Training logs and rollout traces are written under `CKPTS_DIR`. The released PI-Mem-35B-A3B checkpoint was trained for **80 rollout steps**. `trainer.total_epochs` in the example launcher is only a scheduling placeholder and does not represent the reported training duration.
 
 > [!NOTE]
-> Qwen3.5 may encounter a Megatron tensor-parallel shape error when `TP > 2`. If this occurs, apply the fix from [NVIDIA/Megatron-LM#3529](https://github.com/NVIDIA/Megatron-LM/pull/3529/changes) to [`megatron/core/transformer/attention.py`](https://github.com/NVIDIA/Megatron-LM/pull/3529/changes#diff-cfcaf53b88d3893379f5522e1e2a6d0b15eba6158e964fb1892415de482aadf8).
+> - On our H200 cluster, we use the cluster-specific [`run_qwen3_5_35b_megatron_rjob.sh`](./examples/parallel_trainer/run_qwen3_5_35b_megatron_rjob.sh) and [`run_qwen3_5_35b_megatron_memagent_rjob.sh`](./examples/parallel_trainer/run_qwen3_5_35b_megatron_memagent_rjob.sh) scripts to run PI-Mem and MemAgent training, respectively, as multi-node Ray jobs.
+> - Qwen3.5 may encounter a Megatron tensor-parallel shape error when `TP > 2`. If this occurs, apply the fix from [NVIDIA/Megatron-LM#3529](https://github.com/NVIDIA/Megatron-LM/pull/3529/changes) to [`megatron/core/transformer/attention.py`](https://github.com/NVIDIA/Megatron-LM/pull/3529/changes#diff-cfcaf53b88d3893379f5522e1e2a6d0b15eba6158e964fb1892415de482aadf8).
 
 ## Acknowledgements
 
