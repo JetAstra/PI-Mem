@@ -8,7 +8,7 @@ conda activate /mnt/shared-storage-user/dllm-share/songhaixu/miniforge3/envs/qwe
 cd /mnt/shared-storage-user/liudawei/home/verl/
 echo "$(which python)"
 
-export LLM_JUDGE=N
+export LLM_JUDGE=N  # don't use llm judge for reward model evaluation
 # export VERIFIER_PATH=/mnt/shared-storage-user/dllm-share/Models/Qwen2_2.5/Qwen2.5-32B-Instruct/
 # export VERIFIER_HOST=100.97.88.167
 # export VERIFIER_PORT=23547

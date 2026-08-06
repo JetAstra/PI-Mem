@@ -14,11 +14,11 @@
 ---
 
 <p align="center">
-  <img src="./assets/teaser.png" width="80%" alt="Comparison between recurrent memory and PI-Mem">
+  <img src="./assets/teaser.png" width="60%" alt="Comparison between recurrent memory and PI-Mem">
 </p>
 
 <p align="center"><em>
-Recurrent memory processes chunks sequentially and may overwrite early evidence with later noise. PI-Mem reads chunks in parallel against a shared memory, preserving relevant evidence while shortening the serial inference path.
+Recurrent memory processes chunks sequentially and may overwrite early evidence with later noise. PI-Mem reads chunks in parallel conditioned on a shared global memory, improving evidence preservation and reducing inference latency.
 </em></p>
 
 ## Overview
@@ -39,8 +39,9 @@ This branch is based on [verl v0.4.1](https://github.com/verl-project/verl/tree/
 
 ## Training
 
-We adopt the same dataset [`hotpotqa_train_32k.parquet`](https://huggingface.co/datasets/BytedTsinghua-SIA/hotpotqa/blob/main/hotpotqa_train_32k.parquet) as MemAgent for training. The training configuration is provided in [`run_parallel_7B_debug.sh`](./run_parallel_7B_debug.sh). Before launching, update the Conda environment, model path, data paths, checkpoint directory, and distributed settings near the top of the script for your system.
+We adopt the same dataset [`hotpotqa_train_32k.parquet`](https://huggingface.co/datasets/BytedTsinghua-SIA/hotpotqa/blob/main/hotpotqa_train_32k.parquet) as MemAgent for training. 
 
+The training configuration is provided in [`run_parallel_7B_debug.sh`](./run_parallel_7B_debug.sh). Before launching, update the Conda environment, model path, data paths, checkpoint directory, and distributed settings near the top of the script for your system.
 
 The released PI-Mem-7B checkpoint corresponds to **rollout step 240**.
 
